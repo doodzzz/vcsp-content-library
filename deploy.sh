@@ -34,7 +34,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="2.0.0"
+readonly VCSP_VERSION="2.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -53,9 +53,13 @@ readonly NGINX_PROXY_KEY_CONF=/etc/nginx/vcsp-proxy-key.conf
 readonly TENANT_NAME_RE='^[a-z][a-z0-9-]{1,30}[a-z0-9]$'
 readonly RESERVED_TENANTS="lib upload api tenants admin provider default static archive"
 
-# Photon OS package names. python3-xml carries xml.etree (OVF parsing);
-# openssl creates certificates and password hashes; util-linux provides runuser.
-readonly RUNTIME_PKGS=(nginx python3 python3-xml openssl iptables curl tar gzip util-linux shadow findutils logrotate)
+# Photon OS package names for everything this script and the services run.
+# python3-xml carries xml.etree (OVF parsing); openssl creates certificates and
+# password hashes; shadow provides useradd; iproute2 provides ip. Photon builds
+# util-linux without PAM or libcap-ng, so it ships neither runuser nor setpriv;
+# this script therefore drops privileges with python3 (see as_user).
+readonly RUNTIME_PKGS=(nginx python3 python3-xml openssl iptables curl tar gzip shadow findutils logrotate
+                       coreutils gawk sed grep iproute2)
 
 NON_INTERACTIVE=${VCSP_NON_INTERACTIVE:-0}
 GENERATED=()
@@ -73,6 +77,25 @@ trap 'on_err $LINENO "$BASH_COMMAND"' ERR
 usage() { awk 'NR > 2 && /^# ====/ { exit } NR > 2 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 require_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
+
+# as_user USER COMMAND [ARGS...]: run COMMAND as USER with USER's groups.
+# Photon OS has neither runuser nor setpriv, and su is optional (shadow-tools),
+# so privileges are dropped with python3, which is always installed here.
+as_user() {
+  local user=$1
+  shift
+  python3 -c 'import os, pwd, sys
+u = pwd.getpwnam(sys.argv[1])
+os.initgroups(u.pw_name, u.pw_gid)
+os.setgid(u.pw_gid)
+os.setuid(u.pw_uid)
+os.environ.update(HOME=u.pw_dir, USER=u.pw_name, LOGNAME=u.pw_name)
+os.execvp(sys.argv[2], sys.argv[2:])' "$user" "$@"
+}
+
+# host names without the hostname command (a separate, optional package on Photon OS)
+host_fqdn() { python3 -c 'import socket; print(socket.getfqdn())'; }
+host_short() { python3 -c 'import socket; print(socket.gethostname())'; }
 
 photon_major() {
   [[ -r /etc/os-release ]] || die "cannot read /etc/os-release"
@@ -226,7 +249,7 @@ write_bundle_manifest() {  # write_bundle_manifest DEST RPMS_DOWNLOADED_AT REUSE
     echo "photon_major=$(photon_major)"
     echo "created=$created"
     echo "payload_updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "host=$(hostname)"
+    echo "host=$(host_short)"
     echo "packages=${RUNTIME_PKGS[*]}"
     echo "rpm_count=$(find "$dest/rpms" -maxdepth 1 -name '*.rpm' | wc -l)"
   } > "$dest/BUNDLE.txt"
@@ -419,7 +442,7 @@ install_payload() {
   fi
   if [[ $SERVER_FQDN == vcsp.example.local ]]; then
     local detected
-    detected=$(hostname -f 2>/dev/null || hostname)
+    detected=$(host_fqdn)
     if [[ $NON_INTERACTIVE != 1 && -t 0 ]]; then
       read -rp "DNS name subscribers will use [$detected]: " SERVER_FQDN
       SERVER_FQDN=${SERVER_FQDN:-$detected}
@@ -437,7 +460,7 @@ build_san() {
   [[ $short != "$SERVER_FQDN" ]] && san+=",DNS:$short"
   while read -r ip; do
     [[ -n $ip ]] && san+=",IP:$ip"
-  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]}')
+  done < <(if command -v ip >/dev/null; then ip -4 -o addr show scope global | awk '{split($4, a, "/"); print a[1]}'; fi)
   printf '%s' "$san"
 }
 
@@ -825,7 +848,7 @@ configure_systemd() {
 initial_index() {
   info "Building the library index"
   systemctl start vcsp-index.service || warn "the first index run reported a problem: journalctl -u vcsp-index"
-  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --status | head -20 || true
+  as_user "$VCSP_USER" python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --status | head -20 || true
 }
 
 # ----------------------------------------------------------------- firewall
@@ -1101,7 +1124,7 @@ tenant_add() {
   install -d -m 0755 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/tenants" "$DATA_ROOT_REAL/tenants/$t" "$DATA_ROOT_REAL/tenants/$t/lib"
   install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/tenants/$t/staging" "$STATE_DIR_REAL/tenants" "$STATE_DIR_REAL/tenants/$t"
   apply_tenant_nginx "$t"
-  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --wait 60 >/dev/null \
+  as_user "$VCSP_USER" python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --wait 60 >/dev/null \
     || die "the first index run for tenant $t failed"
 
   local base="https://$SERVER_FQDN"
@@ -1162,7 +1185,7 @@ tenant_show() {
   printf '%-26s %s\n' "Administrators" "$(cut -d: -f1 "$TENANT_CONF_DIR/$t/htpasswd-admin" | paste -sd ' ' -)"
   printf '%-26s %s\n' "Library folder" "$DATA_ROOT_REAL/tenants/$t/lib ($(du -sh "$DATA_ROOT_REAL/tenants/$t" 2>/dev/null | cut -f1))"
   echo
-  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --status || true
+  as_user "$VCSP_USER" python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --status || true
 }
 
 tenant_update() {
@@ -1305,7 +1328,7 @@ library_path_ok() {  # nginx refuses links below the document root
   for p in "$DATA_ROOT_REAL/lib" "$DATA_ROOT_REAL/lib/lib.json"; do
     [[ -e $p && ! -L $p ]] || return 1
   done
-  runuser -u nginx -- test -r "$DATA_ROOT_REAL/lib/lib.json"
+  as_user nginx test -r "$DATA_ROOT_REAL/lib/lib.json"
 }
 
 verify() {
@@ -1368,7 +1391,7 @@ verify() {
 status() {
   systemctl --no-pager --lines=0 status nginx vcsp-upload vcsp-index.timer 2>/dev/null | grep -E '^(●|○|\S+ )|Active:' || true
   echo
-  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --status || true
+  as_user "$VCSP_USER" python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --status || true
   echo
   df -h "$DATA_ROOT_REAL" | tail -1 | awk '{printf "Library storage: %s used of %s (%s free)\n", $3, $2, $4}'
   if [[ $DATA_ROOT_REAL != "$DATA_ROOT" ]]; then
@@ -1386,7 +1409,7 @@ status() {
 }
 
 reindex() {
-  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --wait 300 "$@"
+  as_user "$VCSP_USER" python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --wait 300 "$@"
 }
 
 # ----------------------------------------------------------------- install / uninstall
