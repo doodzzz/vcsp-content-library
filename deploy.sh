@@ -2,9 +2,10 @@
 # =============================================================================
 # deploy.sh - deploy and operate the VCSP external content library on Photon OS
 #
-# Serves a VMware Content Subscription Protocol (VCSP) endpoint that VMware
-# Cloud Director catalogs and vCenter content libraries subscribe to, plus an
-# upload portal for templates and ISOs. Supported: Photon OS 4.x and 5.x.
+# Serves VMware Content Subscription Protocol (VCSP) endpoints that VMware
+# Cloud Director catalogs and vCenter content libraries subscribe to, plus
+# upload portals for templates and ISOs: one provider library and any number
+# of isolated tenant libraries. Supported: Photon OS 4.x and 5.x.
 #
 #   ./deploy.sh download-prereqs [--dest DIR] [--archive] [--refresh]
 #                                 build or update an offline bundle (reused when complete)
@@ -14,14 +15,26 @@
 #   ./deploy.sh cert-csr | cert-install CERT KEY [CHAIN]
 #   ./deploy.sh uninstall [--purge]
 #
+# Tenants (each gets /tenants/NAME/lib/lib.json and /tenants/NAME/upload/):
+#   ./deploy.sh tenant-add NAME [--display TEXT] [--admin USER] [--quota-gb N]
+#                               [--lib-allow CIDRS] [--admin-allow CIDRS]
+#   ./deploy.sh tenant-list | tenant-show NAME
+#   ./deploy.sh tenant-update NAME [--display TEXT] [--quota-gb N] [--lib-allow CIDRS] [--admin-allow CIDRS]
+#   ./deploy.sh tenant-add-admin NAME USER | tenant-remove-admin NAME USER
+#   ./deploy.sh tenant-set-library-password NAME
+#   ./deploy.sh tenant-suspend NAME | tenant-resume NAME | tenant-remove NAME [--keep-data]
+#
 # Non-interactive installs read VCSP_ADMIN_USER, VCSP_ADMIN_PASSWORD and
 # VCSP_LIB_PASSWORD from the environment; missing passwords are generated
 # and written to /root/vcsp-initial-credentials.txt (mode 0600).
+# Non-interactive tenant-add reads VCSP_TENANT_ADMIN_USER (or --admin),
+# VCSP_TENANT_ADMIN_PASSWORD (required) and VCSP_TENANT_LIB_PASSWORD
+# (generated when empty); tenant-remove needs VCSP_CONFIRM_REMOVE=NAME.
 # =============================================================================
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="1.0.2"
+readonly VCSP_VERSION="2.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -33,6 +46,12 @@ readonly NGINX_CONF=/etc/nginx/nginx.conf
 readonly NGINX_HEADERS=/etc/nginx/vcsp-headers.conf
 readonly CRED_FILE=/root/vcsp-initial-credentials.txt
 readonly BUNDLE_CACHE=/var/cache/vcsp/bundle
+readonly TENANT_CONF_DIR=$VCSP_ETC/tenants                 # must match TENANT_CONF_DIR in the Python services
+readonly NGINX_TENANT_DIR=/etc/nginx/vcsp-tenants
+readonly PROXY_KEY_FILE=$VCSP_ETC/proxy.key                # must match PROXY_KEY_FILE in the Python services
+readonly NGINX_PROXY_KEY_CONF=/etc/nginx/vcsp-proxy-key.conf
+readonly TENANT_NAME_RE='^[a-z][a-z0-9-]{1,30}[a-z0-9]$'
+readonly RESERVED_TENANTS="lib upload api tenants admin provider default static archive"
 
 # Photon OS package names. python3-xml carries xml.etree (OVF parsing);
 # openssl creates certificates and password hashes; util-linux provides runuser.
@@ -51,7 +70,7 @@ die()  { log ERROR "$@"; exit 1; }
 on_err() { log ERROR "command failed (line $1): $2"; }
 trap 'on_err $LINENO "$BASH_COMMAND"' ERR
 
-usage() { sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 2 && /^# ====/ { exit } NR > 2 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 require_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
 
@@ -72,7 +91,7 @@ load_config() {
   LIB_NAME="Enterprise Content Library"; SERVER_FQDN="vcsp.example.local"; PUBLIC_BASE_URL=""
   DATA_ROOT=/srv/vcsp; STATE_DIR=/var/lib/vcsp; LIB_AUTH=basic; LIB_ALLOW_CIDRS=""; ADMIN_ALLOW_CIDRS=""
   UPLOAD_LISTEN=127.0.0.1; UPLOAD_PORT=8080; UPLOAD_CHUNK_MB=64; INDEX_INTERVAL=5min
-  HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"
+  HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"; TENANT_DEFAULT_QUOTA_GB=0
   local src=$CONF_FILE
   [[ -f $src ]] || src=$SCRIPT_DIR/config/vcsp.conf
   [[ -f $src ]] || die "no configuration found ($CONF_FILE or $SCRIPT_DIR/config/vcsp.conf)"
@@ -86,6 +105,7 @@ load_config() {
     die "UPLOAD_CHUNK_MB must be 1-512"
   fi
   [[ $UPLOAD_PORT =~ ^[0-9]+$ ]] || die "UPLOAD_PORT must be a number"
+  [[ $TENANT_DEFAULT_QUOTA_GB =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TENANT_DEFAULT_QUOTA_GB must be a number of GiB"
   local cidr
   for cidr in ${LIB_ALLOW_CIDRS//,/ } ${ADMIN_ALLOW_CIDRS//,/ }; do
     [[ $cidr =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || die "'$cidr' is not an IP address or CIDR"
@@ -357,6 +377,9 @@ create_user_and_dirs() {
   # 0751: nginx workers must traverse into /etc/vcsp to read the htpasswd files;
   # the files themselves stay group-restricted (vcsp.conf -> vcsp, htpasswd/tls -> nginx)
   install -d -m 0751 -o root -g "$VCSP_USER" "$VCSP_ETC"
+  install -d -m 0751 -o root -g "$VCSP_USER" "$TENANT_CONF_DIR"
+  install -d -m 0755 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/tenants"
+  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$STATE_DIR_REAL/tenants"
   if [[ -n $(find "$DATA_ROOT_REAL/lib" -mindepth 1 ! -user "$VCSP_USER" -print -quit) ]]; then
     info "Taking ownership of existing library content in $DATA_ROOT_REAL/lib"
     chown -R "$VCSP_USER:$VCSP_USER" "$DATA_ROOT_REAL/lib"
@@ -704,8 +727,17 @@ $admin_acl            auth_basic "VCSP upload portal";
             proxy_set_header X-Remote-User \$remote_user;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header Authorization "";
+            proxy_set_header X-VCSP-Tenant "_provider";
+            include $NGINX_PROXY_KEY_CONF;
             include $NGINX_HEADERS;
         }
+
+        # tenant libraries and portals: one generated file per active tenant
+        # (deploy.sh tenant-add); unknown or suspended tenants fall through to 404
+        location /tenants/ {
+            return 404;
+        }
+        include $NGINX_TENANT_DIR/*.conf;
 
         location / {
             return 404;
@@ -726,10 +758,25 @@ add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; st
 EOF
 }
 
+configure_proxy_key() {  # shared secret proving to vcsp-upload that a request came through nginx
+  if [[ ! -s $PROXY_KEY_FILE ]]; then
+    (umask 077; openssl rand -hex 32 > "$PROXY_KEY_FILE")
+    info "Generated the nginx-to-backend proxy key"
+  fi
+  chown root:"$VCSP_USER" "$PROXY_KEY_FILE"
+  chmod 0640 "$PROXY_KEY_FILE"
+  # nginx reads its configuration as root, so this include can stay 0600
+  (umask 077; printf '# Generated by deploy.sh - proves to vcsp-upload that a request came through nginx.\nproxy_set_header X-VCSP-Proxy-Key "%s";\n' \
+    "$(cat "$PROXY_KEY_FILE")" > "$NGINX_PROXY_KEY_CONF")
+  chmod 0600 "$NGINX_PROXY_KEY_CONF"
+}
+
 configure_nginx() {
   [[ -f $NGINX_CONF && ! -f $NGINX_CONF.photon-default ]] && cp -p "$NGINX_CONF" "$NGINX_CONF.photon-default"
   [[ -f $NGINX_CONF ]] && cp -p "$NGINX_CONF" "$NGINX_CONF.vcsp-previous"
   render_nginx_headers > "$NGINX_HEADERS"
+  configure_proxy_key
+  render_all_tenants
   render_nginx_conf > "$NGINX_CONF"
   if ! nginx -t -q; then
     [[ -f $NGINX_CONF.vcsp-previous ]] && cp -p "$NGINX_CONF.vcsp-previous" "$NGINX_CONF"
@@ -805,6 +852,407 @@ configure_firewall() {
     fi
   fi
   info "Firewall: TCP ${ports[*]} open and persisted"
+}
+
+# ----------------------------------------------------------------- tenants
+# Each tenant has its own library (DATA_ROOT/tenants/NAME/lib), staging area,
+# index state (STATE_DIR/tenants/NAME), portal administrators, subscription
+# password and optional quota, described by TENANT_CONF_DIR/NAME/tenant.conf.
+# nginx gets one generated file per active tenant in NGINX_TENANT_DIR; it
+# authenticates against that tenant's own password files and stamps the tenant
+# name on every API request, so tenants cannot reach each other's content.
+
+TENANT_CREATING=""            # set while tenant-add runs; triggers rollback on failure
+REPLY_USER=""
+
+tenant_names() {  # tenant_names [active|all]: registered tenants, sorted
+  local filter=${1:-all} dir t
+  for dir in "$TENANT_CONF_DIR"/*/; do
+    [[ -f $dir/tenant.conf ]] || continue
+    t=$(basename "$dir")
+    [[ $t =~ $TENANT_NAME_RE ]] || continue
+    if [[ $filter == active && $(tenant_get "$t" TENANT_STATE) != active ]]; then
+      continue
+    fi
+    printf '%s\n' "$t"
+  done
+}
+
+tenant_get() {  # tenant_get NAME KEY: value from tenant.conf (parsed, never sourced)
+  local file="$TENANT_CONF_DIR/$1/tenant.conf"
+  [[ -f $file ]] || return 0
+  sed -n "s/^$2=\"\(.*\)\"\$/\1/p" "$file" | tail -n 1
+}
+
+tenant_set() {  # tenant_set NAME KEY VALUE (value already validated)
+  local file="$TENANT_CONF_DIR/$1/tenant.conf" tmp
+  tmp=$(mktemp)
+  grep -v "^$2=" "$file" > "$tmp" || true
+  printf '%s="%s"\n' "$2" "$3" >> "$tmp"
+  install -m 0640 -o root -g "$VCSP_USER" "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+validate_tenant_name() {  # validate_tenant_name NAME [new|existing]
+  local t=$1 mode=${2:-existing}
+  [[ -n $t ]] || die "a tenant name is required"
+  [[ $t =~ $TENANT_NAME_RE ]] || die "tenant names use 3-32 lowercase letters, digits and hyphens, start with a letter and end with a letter or digit (for example acme-bank)"
+  [[ " $RESERVED_TENANTS " != *" $t "* ]] || die "'$t' is reserved; choose another tenant name"
+  if [[ $mode == new ]]; then
+    [[ ! -e $TENANT_CONF_DIR/$t ]] || die "tenant $t already exists"
+    [[ ! -e $DATA_ROOT_REAL/tenants/$t && ! -e $STATE_DIR_REAL/tenants/$t ]] \
+      || die "leftover data for '$t' exists under $DATA_ROOT_REAL/tenants or $STATE_DIR_REAL/tenants; remove it or choose another name"
+  else
+    [[ -f $TENANT_CONF_DIR/$t/tenant.conf ]] || die "tenant $t does not exist (see 'deploy.sh tenant-list')"
+  fi
+}
+
+validate_display() {
+  local re='^[A-Za-z0-9][A-Za-z0-9 ._(),&-]{0,63}$'
+  [[ $1 =~ $re ]] || die "display names use up to 64 letters, digits, spaces and . _ ( ) , & -"
+}
+
+validate_quota() {
+  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] || die "quota must be a number of GiB (0 = unlimited)"
+}
+
+validate_cidrs() {
+  local cidr
+  for cidr in ${1//,/ }; do
+    [[ $cidr =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || die "'$cidr' is not an IP address or CIDR"
+  done
+}
+
+read_username() {  # read_username PROMPT ENV_VAR -> REPLY_USER (always required)
+  local v=${!2:-}
+  if [[ -z $v && $NON_INTERACTIVE != 1 && -t 0 ]]; then
+    read -rp "$1: " v
+  fi
+  [[ -n $v ]] || die "an administrator user name is required (--admin USER or $2)"
+  [[ $v =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "user names use 1-64 letters, digits and . _ @ -"
+  [[ $v != vcsp-verify-* ]] || die "user names starting with vcsp-verify- are reserved"
+  REPLY_USER=$v
+}
+
+read_required_password() {  # read_required_password PROMPT ENV_VAR LABEL -> REPLY_PW (never generated)
+  local prompt=$1 envvar=$2 label=$3 v v2
+  v=${!envvar:-}
+  if [[ -z $v ]]; then
+    [[ $NON_INTERACTIVE != 1 && -t 0 ]] || die "$label is required; set $envvar for non-interactive runs"
+    while :; do
+      read -rsp "$prompt (12+ characters): " v; echo >&2
+      (( ${#v} >= 12 )) || { warn "use at least 12 characters"; continue; }
+      read -rsp "Confirm: " v2; echo >&2
+      [[ $v == "$v2" ]] && break
+      warn "the passwords do not match"
+    done
+  fi
+  (( ${#v} >= 12 )) || die "$label must be at least 12 characters"
+  REPLY_PW=$v
+}
+
+render_tenant_conf() {  # render_tenant_conf NAME: nginx locations for one tenant
+  local t=$1 tdir="$TENANT_CONF_DIR/$1" body_mb=$((UPLOAD_CHUNK_MB + 1)) lib_acl admin_acl
+  lib_acl=$(acl_lines "$(tenant_get "$t" TENANT_LIB_ALLOW_CIDRS)"; printf x); lib_acl=${lib_acl%x}
+  admin_acl=$(acl_lines "$(tenant_get "$t" TENANT_ADMIN_ALLOW_CIDRS)"; printf x); admin_acl=${admin_acl%x}
+  cat <<EOF
+# Tenant $t - generated by deploy.sh $VCSP_VERSION; change it with 'deploy.sh tenant-update $t'.
+# Subscription URL: https://$SERVER_FQDN/tenants/$t/lib/lib.json   Portal: https://$SERVER_FQDN/tenants/$t/upload/
+
+        location /tenants/$t/lib/ {
+            root $DATA_ROOT_REAL;
+$lib_acl            auth_basic "VCSP library: $t";
+            auth_basic_user_file $tdir/htpasswd-library;
+            limit_except GET {
+                deny all;
+            }
+            autoindex off;
+            disable_symlinks on from=\$document_root;
+            types {
+                application/json          json;
+                application/xml           ovf;
+                text/plain                mf cert;
+                application/octet-stream  vmdk iso nvram ova;
+            }
+            default_type application/octet-stream;
+            add_header Cache-Control \$vcsp_cache_control always;
+            include $NGINX_HEADERS;
+        }
+
+        location /tenants/$t/upload/ {
+            alias $VCSP_HOME/app/static/;
+            index index.html;
+$admin_acl            auth_basic "VCSP portal: $t";
+            auth_basic_user_file $tdir/htpasswd-admin;
+            limit_req zone=vcsp_admin burst=60 nodelay;
+            add_header Cache-Control "no-cache" always;
+            include $NGINX_HEADERS;
+        }
+
+        location /tenants/$t/upload/api/ {
+$admin_acl            auth_basic "VCSP portal: $t";
+            auth_basic_user_file $tdir/htpasswd-admin;
+            limit_req zone=vcsp_admin burst=60 nodelay;
+            client_max_body_size ${body_mb}m;
+            proxy_pass http://vcsp_upload/api/;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_read_timeout 900s;
+            proxy_send_timeout 900s;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-Host \$http_host;
+            proxy_set_header X-Remote-User \$remote_user;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header Authorization "";
+            proxy_set_header X-VCSP-Tenant "$t";
+            include $NGINX_PROXY_KEY_CONF;
+            include $NGINX_HEADERS;
+        }
+EOF
+}
+
+render_all_tenants() {  # one nginx file per active tenant; suspended tenants get none (404)
+  install -d -m 0755 "$NGINX_TENANT_DIR"
+  rm -f "$NGINX_TENANT_DIR"/*.conf
+  local t
+  while read -r t; do
+    [[ -n $t ]] && render_tenant_conf "$t" > "$NGINX_TENANT_DIR/$t.conf"
+  done < <(tenant_names active)
+}
+
+apply_tenant_nginx() {  # apply_tenant_nginx NAME: (re)write or remove the tenant's nginx file, test, reload
+  local t=$1 file="$NGINX_TENANT_DIR/$1.conf" backup=""
+  install -d -m 0755 "$NGINX_TENANT_DIR"
+  if [[ -f $file ]]; then
+    backup=$(mktemp)
+    cp -p "$file" "$backup"
+  fi
+  if [[ $(tenant_get "$t" TENANT_STATE) == active ]]; then
+    render_tenant_conf "$t" > "$file"
+  else
+    rm -f "$file"
+  fi
+  if ! nginx -t -q; then
+    if [[ -n $backup ]]; then mv "$backup" "$file"; else rm -f "$file"; fi
+    die "nginx rejected the configuration for tenant $t; the previous one was restored"
+  fi
+  [[ -n $backup ]] && rm -f "$backup"
+  systemctl reload nginx
+}
+
+tenant_rollback() {  # EXIT trap during tenant-add: remove whatever a failed onboarding created
+  local t=$TENANT_CREATING
+  [[ -n $t ]] || return 0
+  TENANT_CREATING=""
+  warn "onboarding of tenant $t failed; removing what was created"
+  rm -f "$NGINX_TENANT_DIR/$t.conf"
+  if nginx -t -q 2>/dev/null; then systemctl reload nginx 2>/dev/null || true; fi
+  rm -rf "${TENANT_CONF_DIR:?}/$t" "${DATA_ROOT_REAL:?}/tenants/$t" "${STATE_DIR_REAL:?}/tenants/$t"
+}
+
+tenant_add() {
+  local t=${1:-} display="" quota="" lib_allow="" admin_allow="" admin_pw lib_pw
+  shift || true
+  while (( $# )); do
+    case $1 in
+      --display) display=${2:?--display needs a value}; shift 2 ;;
+      --admin) export VCSP_TENANT_ADMIN_USER=${2:?--admin needs a user name}; shift 2 ;;
+      --quota-gb) quota=${2:?--quota-gb needs a number}; shift 2 ;;
+      --lib-allow) lib_allow=${2:?--lib-allow needs CIDRs}; shift 2 ;;
+      --admin-allow) admin_allow=${2:?--admin-allow needs CIDRs}; shift 2 ;;
+      --non-interactive) NON_INTERACTIVE=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  require_root
+  load_config
+  [[ -f $CONF_FILE && -x $VCSP_HOME/bin/vcsp-index ]] || die "install the library first: deploy.sh install"
+  validate_tenant_name "$t" new
+  display=${display:-$t}
+  validate_display "$display"
+  quota=${quota:-${TENANT_DEFAULT_QUOTA_GB:-0}}
+  validate_quota "$quota"
+  validate_cidrs "$lib_allow $admin_allow"
+
+  read_username "Administrator user name for tenant $t" VCSP_TENANT_ADMIN_USER
+  read_required_password "Password for $REPLY_USER" VCSP_TENANT_ADMIN_PASSWORD "the tenant administrator password"
+  admin_pw=$REPLY_PW
+  read_password "Library password for subscribers of $t (user name is always 'vcsp')" VCSP_TENANT_LIB_PASSWORD \
+    "Library subscription password for tenant $t (user vcsp)"
+  lib_pw=$REPLY_PW
+
+  info "Onboarding tenant $t ($display)"
+  TENANT_CREATING=$t
+  trap tenant_rollback EXIT
+  install -d -m 0751 -o root -g "$VCSP_USER" "$TENANT_CONF_DIR" "$TENANT_CONF_DIR/$t"
+  local tmp
+  tmp=$(mktemp)
+  {
+    echo "# Tenant $t - managed by deploy.sh (tenant-update, tenant-suspend, tenant-resume)."
+    printf 'TENANT_NAME="%s"\nTENANT_DISPLAY_NAME="%s"\nTENANT_CREATED="%s"\nTENANT_STATE="active"\n' \
+      "$t" "$display" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'TENANT_QUOTA_GB="%s"\nTENANT_LIB_ALLOW_CIDRS="%s"\nTENANT_ADMIN_ALLOW_CIDRS="%s"\n' \
+      "$quota" "$lib_allow" "$admin_allow"
+  } > "$tmp"
+  install -m 0640 -o root -g "$VCSP_USER" "$tmp" "$TENANT_CONF_DIR/$t/tenant.conf"
+  rm -f "$tmp"
+  set_htpasswd "$TENANT_CONF_DIR/$t/htpasswd-admin" "$REPLY_USER" "$admin_pw"
+  set_htpasswd "$TENANT_CONF_DIR/$t/htpasswd-library" vcsp "$lib_pw"
+  install -d -m 0755 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/tenants" "$DATA_ROOT_REAL/tenants/$t" "$DATA_ROOT_REAL/tenants/$t/lib"
+  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/tenants/$t/staging" "$STATE_DIR_REAL/tenants" "$STATE_DIR_REAL/tenants/$t"
+  apply_tenant_nginx "$t"
+  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --wait 60 >/dev/null \
+    || die "the first index run for tenant $t failed"
+
+  local base="https://$SERVER_FQDN"
+  CHECK_FAILS=0
+  check "tenant $t: lib.json without credentials returns 401" test "$(http_code "$base/tenants/$t/lib/lib.json")" = 401
+  check "tenant $t: lib.json as user vcsp returns 200" test "$(http_code "$base/tenants/$t/lib/lib.json" "vcsp:$lib_pw")" = 200
+  check "tenant $t: portal API answers for $REPLY_USER" test "$(http_code "$base/tenants/$t/upload/api/config" "$REPLY_USER:$admin_pw")" = 200
+  check "tenant $t: provider administrators are refused" \
+    test "$(probe_code "$VCSP_ETC/htpasswd-admin" "$base/tenants/$t/upload/api/config")" = 401
+  (( CHECK_FAILS == 0 )) || die "tenant $t did not pass its checks"
+  TENANT_CREATING=""
+  trap - EXIT
+
+  if (( ${#GENERATED[@]} )); then
+    local cred="/root/vcsp-tenant-$t-credentials.txt"
+    {
+      echo "# VCSP tenant $t - generated credentials ($(date -u +%Y-%m-%dT%H:%MZ))"
+      echo "# Hand the library password to the tenant's Cloud Director administrators, then delete this file."
+      printf '%s\n' "${GENERATED[@]}"
+    } > "$cred"
+    chmod 0600 "$cred"
+    warn "The generated library password is in $cred (mode 0600)."
+  fi
+  echo >&2
+  info "Tenant $t is ready"
+  info "  Subscription URL : ${PUBLIC_BASE_URL:-$base}/tenants/$t/lib/lib.json   (user: vcsp)"
+  info "  Upload portal    : ${PUBLIC_BASE_URL:-$base}/tenants/$t/upload/   (user: $REPLY_USER)"
+  info "  Storage quota    : $([[ $quota == 0 ]] && echo unlimited || echo "$quota GiB")"
+}
+
+tenant_list() {
+  local t n=0 items size quota state
+  printf '%-20s %-26s %-10s %6s %6s %9s %9s\n' TENANT "DISPLAY NAME" STATE ADMINS ITEMS SIZE QUOTA
+  while read -r t; do
+    [[ -n $t ]] || continue
+    n=$((n + 1))
+    items=$(python3 -c 'import json,sys
+try: print(sum(1 for r in json.load(open(sys.argv[1]))["items"].values() if r.get("entry")))
+except Exception: print(0)' "$STATE_DIR_REAL/tenants/$t/state.json")
+    size=$(du -sh "$DATA_ROOT_REAL/tenants/$t" 2>/dev/null | cut -f1)
+    quota=$(tenant_get "$t" TENANT_QUOTA_GB)
+    state=$(tenant_get "$t" TENANT_STATE)
+    printf '%-20s %-26.26s %-10s %6s %6s %9s %9s\n' "$t" "$(tenant_get "$t" TENANT_DISPLAY_NAME)" "$state" \
+      "$(grep -c . "$TENANT_CONF_DIR/$t/htpasswd-admin" 2>/dev/null || echo 0)" "$items" "${size:-0}" \
+      "$([[ ${quota:-0} == 0 ]] && echo unlimited || echo "${quota}G")"
+  done < <(tenant_names all)
+  (( n )) || echo "(no tenants yet; add one with: deploy.sh tenant-add NAME)"
+}
+
+tenant_show() {
+  local t=$1 base="${PUBLIC_BASE_URL:-https://$SERVER_FQDN}" key
+  validate_tenant_name "$t"
+  for key in TENANT_DISPLAY_NAME TENANT_STATE TENANT_CREATED TENANT_QUOTA_GB TENANT_LIB_ALLOW_CIDRS TENANT_ADMIN_ALLOW_CIDRS; do
+    printf '%-26s %s\n' "$key" "$(tenant_get "$t" "$key")"
+  done
+  printf '%-26s %s\n' "Subscription URL" "$base/tenants/$t/lib/lib.json (user vcsp)"
+  printf '%-26s %s\n' "Upload portal" "$base/tenants/$t/upload/"
+  printf '%-26s %s\n' "Administrators" "$(cut -d: -f1 "$TENANT_CONF_DIR/$t/htpasswd-admin" | paste -sd ' ' -)"
+  printf '%-26s %s\n' "Library folder" "$DATA_ROOT_REAL/tenants/$t/lib ($(du -sh "$DATA_ROOT_REAL/tenants/$t" 2>/dev/null | cut -f1))"
+  echo
+  runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --tenant "$t" --status || true
+}
+
+tenant_update() {
+  local t=${1:-} changed=0
+  shift || true
+  validate_tenant_name "$t"
+  while (( $# )); do
+    case $1 in
+      --display) validate_display "${2:?}"; tenant_set "$t" TENANT_DISPLAY_NAME "$2"; changed=1; shift 2 ;;
+      --quota-gb) validate_quota "${2:?}"; tenant_set "$t" TENANT_QUOTA_GB "$2"; changed=1; shift 2 ;;
+      --lib-allow) validate_cidrs "${2?}"; tenant_set "$t" TENANT_LIB_ALLOW_CIDRS "$2"; changed=1; shift 2 ;;
+      --admin-allow) validate_cidrs "${2?}"; tenant_set "$t" TENANT_ADMIN_ALLOW_CIDRS "$2"; changed=1; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  (( changed )) || die "nothing to change; use --display, --quota-gb, --lib-allow or --admin-allow"
+  apply_tenant_nginx "$t"
+  info "Tenant $t updated (a changed display name reaches subscribers on the next index run)"
+}
+
+tenant_add_admin() {
+  local t=${1:-} user=${2:-} action=added
+  validate_tenant_name "$t"
+  VCSP_TENANT_ADMIN_USER=$user read_username "Administrator user name for tenant $t" VCSP_TENANT_ADMIN_USER
+  grep -q "^${REPLY_USER}:" "$TENANT_CONF_DIR/$t/htpasswd-admin" && action="password reset"
+  read_required_password "Password for $REPLY_USER" VCSP_TENANT_ADMIN_PASSWORD "the administrator password"
+  set_htpasswd "$TENANT_CONF_DIR/$t/htpasswd-admin" "$REPLY_USER" "$REPLY_PW"
+  info "Tenant $t: administrator $REPLY_USER $action"
+}
+
+tenant_remove_admin() {
+  local t=${1:-} user=${2:-}
+  validate_tenant_name "$t"
+  [[ -n $user ]] || die "usage: deploy.sh tenant-remove-admin NAME USER"
+  grep -q "^${user}:" "$TENANT_CONF_DIR/$t/htpasswd-admin" || die "tenant $t has no administrator '$user'"
+  (( $(grep -c . "$TENANT_CONF_DIR/$t/htpasswd-admin") > 1 )) || die "refusing to remove the last administrator of tenant $t"
+  remove_htpasswd_users "$TENANT_CONF_DIR/$t/htpasswd-admin" "^${user}:"
+  info "Tenant $t: administrator $user removed"
+}
+
+tenant_set_library_password() {
+  local t=${1:-}
+  validate_tenant_name "$t"
+  read_password "New library password for tenant $t (user 'vcsp')" VCSP_TENANT_LIB_PASSWORD \
+    "Library subscription password for tenant $t (user vcsp)"
+  set_htpasswd "$TENANT_CONF_DIR/$t/htpasswd-library" vcsp "$REPLY_PW"
+  if (( ${#GENERATED[@]} )); then
+    local cred="/root/vcsp-tenant-$t-credentials.txt"
+    printf '%s\n' "${GENERATED[@]}" > "$cred"
+    chmod 0600 "$cred"
+    warn "The generated password is in $cred (mode 0600)."
+  fi
+  info "Tenant $t: library password changed; update it in the tenant's subscribed catalogs"
+}
+
+tenant_suspend() {
+  local t=${1:-}
+  validate_tenant_name "$t"
+  tenant_set "$t" TENANT_STATE suspended
+  apply_tenant_nginx "$t"
+  info "Tenant $t suspended: its library and portal now return 404; content is kept. Resume with: deploy.sh tenant-resume $t"
+}
+
+tenant_resume() {
+  local t=${1:-}
+  validate_tenant_name "$t"
+  tenant_set "$t" TENANT_STATE active
+  apply_tenant_nginx "$t"
+  info "Tenant $t resumed"
+}
+
+tenant_remove() {
+  local t=${1:-} keep=${2:-no} answer archive
+  validate_tenant_name "$t"
+  if [[ ${VCSP_CONFIRM_REMOVE:-} != "$t" ]]; then
+    [[ $NON_INTERACTIVE != 1 && -t 0 ]] || die "set VCSP_CONFIRM_REMOVE=$t to remove the tenant non-interactively"
+    read -rp "Type the tenant name ($t) to remove it$([[ $keep == yes ]] && echo ', keeping its library in the archive' || echo ' and delete its library'): " answer
+    [[ $answer == "$t" ]] || die "removal cancelled"
+  fi
+  tenant_set "$t" TENANT_STATE removing
+  apply_tenant_nginx "$t"                      # access is revoked before any data is touched
+  if [[ $keep == yes && -d $DATA_ROOT_REAL/tenants/$t/lib ]]; then
+    archive="$DATA_ROOT_REAL/archive/$t-$(date -u +%Y%m%dT%H%M%SZ)"
+    install -d -m 0750 -o root -g root "$DATA_ROOT_REAL/archive" "$archive"
+    mv "$DATA_ROOT_REAL/tenants/$t/lib" "$archive/lib"
+    cp -p "$TENANT_CONF_DIR/$t/tenant.conf" "$archive/tenant.conf"
+    info "Library of $t archived in $archive"
+  fi
+  rm -rf "${DATA_ROOT_REAL:?}/tenants/$t" "${STATE_DIR_REAL:?}/tenants/$t" "${TENANT_CONF_DIR:?}/$t"
+  info "Tenant $t removed; its subscription URL and portal no longer exist"
 }
 
 # ----------------------------------------------------------------- verification
@@ -887,12 +1335,28 @@ verify() {
   fi
   check "hidden files are not served" test "$(http_code "$base/lib/.vcsp-probe")" = 404
   check "portal requires sign-in" test "$(http_code "$base/upload/")" = 401
+  check "backend refuses requests that bypass nginx" \
+    test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-VCSP-Tenant: _provider' "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/config" || true)" = 403
   if [[ -n $ADMIN_PW_VERIFY ]]; then
     check "portal API answers for the administrator" test "$(http_code "$base/upload/api/config" "$ADMIN_PW_VERIFY")" = 200
   else
     check "portal API answers for a signed-in user" \
       test "$(probe_code "$VCSP_ETC/htpasswd-admin" "$base/upload/api/config")" = 200
   fi
+  local t tdir
+  while read -r t; do
+    [[ -n $t ]] || continue
+    tdir=$TENANT_CONF_DIR/$t
+    remove_htpasswd_users "$tdir/htpasswd-library" '^vcsp-verify-'
+    remove_htpasswd_users "$tdir/htpasswd-admin" '^vcsp-verify-'
+    check "tenant $t: lib.json without credentials returns 401" test "$(http_code "$base/tenants/$t/lib/lib.json")" = 401
+    check "tenant $t: lib.json with valid credentials returns 200" \
+      test "$(probe_code "$tdir/htpasswd-library" "$base/tenants/$t/lib/lib.json")" = 200
+    check "tenant $t: portal API answers for a signed-in user" \
+      test "$(probe_code "$tdir/htpasswd-admin" "$base/tenants/$t/upload/api/config")" = 200
+    check "tenant $t: provider administrators are refused" \
+      test "$(probe_code "$VCSP_ETC/htpasswd-admin" "$base/tenants/$t/upload/api/config")" = 401
+  done < <(tenant_names active)
   if (( CHECK_FAILS )); then
     warn "$CHECK_FAILS check(s) failed; see /var/log/nginx/error.log and journalctl -u vcsp-upload"
     warn "'(20: Not a directory)' in the nginx log means a folder in the library path is a symbolic link"
@@ -917,6 +1381,8 @@ status() {
   echo "Prerequisites: ${missing:+missing: }${missing:-all installed}"
   echo "Subscription URL: ${PUBLIC_BASE_URL:-https://$SERVER_FQDN}/lib/lib.json"
   echo "Certificate SHA-256: $(fingerprint 2>/dev/null || echo unavailable)"
+  echo
+  tenant_list
 }
 
 reindex() {
@@ -970,7 +1436,8 @@ uninstall() {
   systemctl daemon-reload
   if [[ -f $NGINX_CONF.photon-default ]]; then
     cp -p "$NGINX_CONF.photon-default" "$NGINX_CONF"
-    rm -f "$NGINX_HEADERS"
+    rm -f "$NGINX_HEADERS" "$NGINX_PROXY_KEY_CONF"
+    rm -rf "$NGINX_TENANT_DIR"
     systemctl restart nginx || true
   fi
   rm -f /usr/local/bin/vcsp-index /etc/logrotate.d/vcsp-nginx
@@ -1031,6 +1498,19 @@ main() {
     cert-install) require_root; load_config; cert_install "${1:-}" "${2:-}" "${3:-}" ;;
     uninstall)
       if [[ ${1:-} == --purge ]]; then uninstall yes; else uninstall no; fi
+      ;;
+    tenant-add) tenant_add "$@" ;;
+    tenant-list) require_root; load_config; tenant_list ;;
+    tenant-show) require_root; load_config; tenant_show "${1:-}" ;;
+    tenant-update) require_root; load_config; tenant_update "$@" ;;
+    tenant-add-admin) require_root; load_config; tenant_add_admin "${1:-}" "${2:-}" ;;
+    tenant-remove-admin) require_root; load_config; tenant_remove_admin "${1:-}" "${2:-}" ;;
+    tenant-set-library-password) require_root; load_config; tenant_set_library_password "${1:-}" ;;
+    tenant-suspend) require_root; load_config; tenant_suspend "${1:-}" ;;
+    tenant-resume) require_root; load_config; tenant_resume "${1:-}" ;;
+    tenant-remove)
+      require_root; load_config
+      if [[ ${2:-} == --keep-data ]]; then tenant_remove "${1:-}" yes; else tenant_remove "${1:-}" no; fi
       ;;
     help|-h|--help) usage ;;
     *) usage; die "unknown command '$cmd'" ;;

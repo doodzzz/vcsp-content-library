@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vcsp-upload - upload portal backend for the VCSP external content library.
+vcsp-upload - multi-tenant upload portal backend for the VCSP content library.
 
-Runs behind nginx on 127.0.0.1 as the unprivileged 'vcsp' user. nginx
-terminates TLS, enforces administrator Basic authentication and passes the
-authenticated user name in X-Remote-User. Python standard library only.
+Runs behind nginx as the unprivileged 'vcsp' user and serves the provider
+library plus any number of tenant libraries. nginx terminates TLS, checks
+each tenant's own administrator passwords, and stamps every API request with:
+
+  X-VCSP-Tenant     the scope nginx authenticated ("_provider" or a tenant name);
+                    nginx overwrites whatever the client sent, so it cannot be spoofed
+  X-VCSP-Proxy-Key  a secret only nginx and this service know, so local users
+                    cannot bypass nginx by calling the loopback port directly
+  X-Remote-User     the authenticated administrator, for the audit trail
+
+Everything a request can touch (library, staging, index state, locks, jobs,
+quota) is derived from that scope, so one tenant can never read or change
+another tenant's content. Python standard library only.
 
 Upload protocol (resumable, no multipart parsing, constant memory):
   POST   /api/uploads                  {item, filename, size} -> {id, offset}
@@ -14,14 +24,11 @@ Upload protocol (resumable, no multipart parsing, constant memory):
   GET    /api/jobs/<id>                job progress
   DELETE /api/items/<item>             remove an item (job)
   GET    /api/config | /api/items | /api/uploads | /api/health
-
-State-changing requests must carry "X-VCSP-Request: 1"; browsers cannot add
-that header cross-site without a CORS preflight this service never grants,
-which blocks CSRF against the administrator's cached Basic credentials.
 """
 
 import argparse
 import fcntl
+import hmac
 import json
 import logging
 import os
@@ -39,9 +46,11 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vcsp_validate as V  # noqa: E402
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 META_FILE = ".vcsp-meta.json"
 COPY_BUF = 1 << 20
+PROVIDER = "_provider"
+TENANT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
 log = logging.getLogger("vcsp-upload")
 
 
@@ -76,9 +85,9 @@ class Settings:
         g = conf.get
         self.conf_path = conf_path
         self.data_root = os.path.abspath(g("DATA_ROOT", "/srv/vcsp"))
-        self.lib_root = os.path.join(self.data_root, "lib")
-        self.staging = os.path.join(self.data_root, "staging")
         self.state_dir = os.path.abspath(g("STATE_DIR", "/var/lib/vcsp"))
+        self.tenant_conf_dir = os.path.abspath(g("TENANT_CONF_DIR", "/etc/vcsp/tenants"))
+        self.proxy_key_file = g("PROXY_KEY_FILE", "/etc/vcsp/proxy.key")
         self.listen = g("UPLOAD_LISTEN", "127.0.0.1")
         self.port = int(g("UPLOAD_PORT", "8080"))
         allowed = []
@@ -101,6 +110,117 @@ class Settings:
         self.public_url = (g("PUBLIC_BASE_URL") or "https://" + fqdn).rstrip("/")
         self.index_bin = g("INDEX_BIN", "/opt/vcsp/bin/vcsp-index")
 
+    def load_proxy_key(self):
+        try:
+            with open(self.proxy_key_file, encoding="utf-8") as fh:
+                key = fh.read().strip()
+        except OSError as exc:
+            raise SystemExit("cannot read the proxy key %s (%s); run 'deploy.sh install'" % (self.proxy_key_file, exc))
+        if len(key) < 32:
+            raise SystemExit("the proxy key in %s is too short" % self.proxy_key_file)
+        return key
+
+
+# ------------------------------------------------------------------ scopes
+class Scope:
+    """Everything one tenant (or the provider library) may touch."""
+
+    def __init__(self, settings, tenant, tconf=None, stamp=None):
+        self.tenant, self.stamp = tenant, stamp
+        tconf = tconf or {}
+        if tenant == PROVIDER:
+            self.lib_root = os.path.join(settings.data_root, "lib")
+            staging = os.path.join(settings.data_root, "staging")
+            self.state_dir = settings.state_dir
+            self.lib_name = settings.lib_name
+            self.url_path = "/lib/lib.json"
+            self.quota = 0
+            self.state = "active"
+        else:
+            base = os.path.join(settings.data_root, "tenants", tenant)
+            self.lib_root = os.path.join(base, "lib")
+            staging = os.path.join(base, "staging")
+            self.state_dir = os.path.join(settings.state_dir, "tenants", tenant)
+            self.lib_name = tconf.get("TENANT_DISPLAY_NAME") or tenant
+            self.url_path = "/tenants/%s/lib/lib.json" % tenant
+            self.quota = int(float(tconf.get("TENANT_QUOTA_GB", "0") or 0) * (1 << 30))
+            self.state = tconf.get("TENANT_STATE", "active")
+        self.staging = staging
+        self.uploads = os.path.join(staging, "uploads")
+        self.ready = os.path.join(staging, "ready")
+        self.trash = os.path.join(staging, "trash")
+
+    @property
+    def label(self):
+        return "provider" if self.tenant == PROVIDER else self.tenant
+
+    def ensure_dirs(self):
+        if not os.path.isdir(self.lib_root):
+            raise FileNotFoundError(self.lib_root)
+        for path in (self.uploads, self.ready, self.trash):
+            os.makedirs(path, mode=0o750, exist_ok=True)
+
+
+class ScopeRegistry:
+    """Resolves tenant names to scopes; re-reads tenant.conf when it changes (no restart needed)."""
+
+    def __init__(self, settings):
+        self.s = settings
+        self._cache, self._lock = {}, threading.Lock()
+
+    def get(self, tenant):
+        if tenant == PROVIDER:
+            with self._lock:
+                if PROVIDER not in self._cache:
+                    self._cache[PROVIDER] = Scope(self.s, PROVIDER)
+                return self._cache[PROVIDER]
+        if not TENANT_RE.match(tenant or ""):
+            return None
+        path = os.path.join(self.s.tenant_conf_dir, tenant, "tenant.conf")
+        try:
+            stamp = os.stat(path).st_mtime_ns
+        except OSError:
+            with self._lock:
+                self._cache.pop(tenant, None)
+            return None
+        with self._lock:
+            scope = self._cache.get(tenant)
+            if scope is None or scope.stamp != stamp:
+                scope = Scope(self.s, tenant, read_conf(path), stamp)
+                self._cache[tenant] = scope
+            return scope
+
+    def all(self):
+        scopes = [self.get(PROVIDER)]
+        try:
+            names = sorted(os.listdir(self.s.tenant_conf_dir))
+        except OSError:
+            names = []
+        for name in names:
+            scope = self.get(name)
+            if scope is not None:
+                scopes.append(scope)
+        return scopes
+
+
+def human(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def tree_size(*roots):
+    total = 0
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                try:
+                    total += os.lstat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    pass
+    return total
+
 
 # ------------------------------------------------------------------ errors / jobs
 class ApiError(Exception):
@@ -110,16 +230,19 @@ class ApiError(Exception):
 
 
 class Job:
-    def __init__(self, kind, item, user):
+    def __init__(self, kind, tenant, item, user):
         self.id = uuid.uuid4().hex
-        self.kind, self.item, self.user = kind, item, user
+        self.kind, self.tenant, self.item, self.user = kind, tenant, item, user
         self.state, self.steps, self.notes = "running", [], []
         self.error, self.result = None, None
         self.started, self.finished = time.time(), None
 
+    def _who(self):
+        return "job=%s tenant=%s item=%s user=%s" % (self.id[:8], self.tenant, self.item, self.user)
+
     def step(self, text):
         self.steps.append(text)
-        log.info("job=%s item=%s user=%s step: %s", self.id[:8], self.item, self.user, text)
+        log.info("%s step: %s", self._who(), text)
 
     def note(self, text):
         self.notes.append(text)
@@ -128,8 +251,7 @@ class Job:
         self.result, self.error = result, error
         self.state = "failed" if error else "done"
         self.finished = time.time()
-        log.info("job=%s kind=%s item=%s user=%s state=%s%s", self.id[:8], self.kind, self.item,
-                 self.user, self.state, (" error=%s" % error) if error else "")
+        log.info("%s kind=%s state=%s%s", self._who(), self.kind, self.state, (" error=%s" % error) if error else "")
 
     def public(self):
         return {"id": self.id, "kind": self.kind, "item": self.item, "state": self.state,
@@ -140,30 +262,38 @@ class Job:
 class Portal:
     def __init__(self, settings):
         self.s = settings
-        self.uploads = os.path.join(settings.staging, "uploads")
-        self.ready = os.path.join(settings.staging, "ready")
-        self.trash = os.path.join(settings.staging, "trash")
-        for path in (self.uploads, self.ready, self.trash):
-            os.makedirs(path, mode=0o750, exist_ok=True)
-        if not os.path.isdir(settings.lib_root):
-            raise SystemExit("library folder %s does not exist" % settings.lib_root)
-        self.same_fs = os.stat(settings.lib_root).st_dev == os.stat(settings.staging).st_dev
-        if not self.same_fs:
-            log.warning("%s and %s are on different filesystems: publishing will copy instead of rename",
-                        settings.staging, settings.lib_root)
+        self.scopes = ScopeRegistry(settings)
+        self.proxy_key = settings.load_proxy_key().encode()
+        try:
+            self.scopes.get(PROVIDER).ensure_dirs()
+        except FileNotFoundError as exc:
+            raise SystemExit("library folder %s does not exist" % exc)
         self._locks, self._guard = {}, threading.Lock()
         self.jobs, self._jobs_guard = {}, threading.Lock()
         threading.Thread(target=self._janitor, name="janitor", daemon=True).start()
 
-    # -------- helpers
+    # -------- scope and helpers
+    def scope(self, tenant):
+        sc = self.scopes.get(tenant)
+        if sc is None:
+            raise ApiError(404, "Unknown tenant.", drain=True)
+        if sc.state != "active":
+            raise ApiError(403, "This tenant is suspended; contact the provider.", drain=True)
+        try:
+            sc.ensure_dirs()
+        except FileNotFoundError:
+            raise ApiError(503, "This tenant's library folder is missing; contact the provider.", drain=True)
+        return sc
+
     def lock_for(self, key):
         with self._guard:
             return self._locks.setdefault(key, threading.Lock())
 
     @contextmanager
-    def index_lock(self, timeout=900):
-        """Same flock the indexer holds, so it never scans a half-swapped item."""
-        fd = os.open(os.path.join(self.s.state_dir, "index.lock"), os.O_RDWR | os.O_CREAT, 0o660)
+    def index_lock(self, sc, timeout=900):
+        """Same flock the indexer holds for this scope, so it never scans a half-swapped item."""
+        os.makedirs(sc.state_dir, mode=0o750, exist_ok=True)
+        fd = os.open(os.path.join(sc.state_dir, "index.lock"), os.O_RDWR | os.O_CREAT, 0o660)
         deadline = time.monotonic() + timeout
         try:
             while True:
@@ -178,13 +308,15 @@ class Portal:
         finally:
             os.close(fd)
 
-    def free_bytes(self):
-        st = os.statvfs(self.s.staging)
+    @staticmethod
+    def free_bytes(sc):
+        st = os.statvfs(sc.staging)
         return st.f_bavail * st.f_frsize
 
-    def read_state(self):
+    @staticmethod
+    def read_state(sc):
         try:
-            with open(os.path.join(self.s.state_dir, "state.json"), encoding="utf-8") as fh:
+            with open(os.path.join(sc.state_dir, "state.json"), encoding="utf-8") as fh:
                 return json.load(fh)
         except (OSError, ValueError):
             return {}
@@ -198,35 +330,40 @@ class Portal:
         except FileNotFoundError:
             return []
 
-    def check_item(self, item):
+    @staticmethod
+    def check_item(item):
         try:
             return V.check_item_name(item)
         except V.ValidationError as exc:
             raise ApiError(400, str(exc))
 
-    def upload_paths(self, uid):
-        return os.path.join(self.uploads, uid + ".part"), os.path.join(self.uploads, uid + ".json")
+    @staticmethod
+    def upload_paths(sc, uid):
+        return os.path.join(sc.uploads, uid + ".part"), os.path.join(sc.uploads, uid + ".json")
 
-    def load_meta(self, uid):
+    def load_meta(self, sc, uid):
         try:
-            with open(self.upload_paths(uid)[1], encoding="utf-8") as fh:
+            with open(self.upload_paths(sc, uid)[1], encoding="utf-8") as fh:
                 return json.load(fh)
         except (OSError, ValueError):
             return None
 
     # -------- read-only API
-    def config(self, user):
-        lib = self.read_state().get("lib") or {}
+    def config(self, sc, user):
+        lib = self.read_state(sc).get("lib") or {}
         return {
-            "lib_name": self.s.lib_name,
-            "subscription_url": self.s.public_url + "/lib/lib.json",
+            "tenant": None if sc.tenant == PROVIDER else sc.tenant,
+            "lib_name": sc.lib_name,
+            "subscription_url": self.s.public_url + sc.url_path,
             "lib_auth": self.s.lib_auth,
             "lib_version": lib.get("version"),
             "allowed_extensions": self.s.allowed,
             "chunk_size": self.s.chunk,
             "max_file_size": self.s.max_file,
-            "free_bytes": self.free_bytes(),
+            "free_bytes": self.free_bytes(sc),
             "reserve_bytes": self.s.reserve,
+            "quota_bytes": sc.quota or None,
+            "used_bytes": tree_size(sc.lib_root, sc.staging) if sc.quota else None,
             "verify_manifest": self.s.verify_mf,
             "ova_extract": self.s.ova_extract,
             "allow_delete": self.s.allow_delete,
@@ -235,18 +372,18 @@ class Portal:
             "version": __version__,
         }
 
-    def items(self):
-        state = self.read_state()
+    def items(self, sc):
+        state = self.read_state(sc)
         by_dir = {}
         for key, rec in (state.get("items") or {}).items():
             by_dir.setdefault(rec.get("dir"), []).append((key, rec))
         out = []
-        with os.scandir(self.s.lib_root) as it:
+        with os.scandir(sc.lib_root) as it:
             dirs = sorted(e.name for e in it if e.is_dir(follow_symlinks=False)
                           and not e.name.startswith(".") and e.name != "lost+found")
         for name in dirs:
             files, newest, description = [], 0, ""
-            with os.scandir(os.path.join(self.s.lib_root, name)) as it:
+            with os.scandir(os.path.join(sc.lib_root, name)) as it:
                 for e in it:
                     if e.name == META_FILE:
                         try:
@@ -280,28 +417,28 @@ class Portal:
             out.append(entry)
         return {"items": out, "lib_version": (state.get("lib") or {}).get("version")}
 
-    def uploads_list(self):
+    def uploads_list(self, sc):
         pending = []
-        for name in sorted(os.listdir(self.uploads)):
+        for name in sorted(os.listdir(sc.uploads)):
             if not name.endswith(".json"):
                 continue
             uid = name[:-5]
-            meta = self.load_meta(uid)
-            part = self.upload_paths(uid)[0]
+            meta = self.load_meta(sc, uid)
+            part = self.upload_paths(sc, uid)[0]
             if meta and os.path.exists(part):
                 pending.append({"id": uid, "item": meta["item"], "filename": meta["filename"],
                                 "size": meta["size"], "offset": os.path.getsize(part),
                                 "user": meta.get("user"), "updated": int(os.path.getmtime(part))})
         ready = []
-        for item in sorted(os.listdir(self.ready)):
-            path = os.path.join(self.ready, item)
+        for item in sorted(os.listdir(sc.ready)):
+            path = os.path.join(sc.ready, item)
             files = [{"name": n, "size": os.path.getsize(os.path.join(path, n))} for n in self.list_files(path)]
             if files:
                 ready.append({"item": item, "files": files})
         return {"uploads": pending, "ready": ready}
 
     # -------- uploads
-    def upload_init(self, body, user):
+    def upload_init(self, sc, body, user):
         item = self.check_item(str(body.get("item", "")).strip())
         filename = str(body.get("filename", "")).strip()
         try:
@@ -315,21 +452,27 @@ class Portal:
             raise ApiError(413, "%s is %.1f GiB; the limit is %.0f GiB (MAX_FILE_SIZE_GB)."
                            % (filename, size / (1 << 30), self.s.max_file / (1 << 30)))
         uid = V.new_hash("sha256")
-        uid.update(("%s\0%s\0%d" % (item, filename, size)).encode())
+        uid.update(("%s\0%s\0%s\0%d" % (sc.tenant, item, filename, size)).encode())
         uid = uid.hexdigest()[:32]
 
-        ready_path = os.path.join(self.ready, item, filename)
+        ready_path = os.path.join(sc.ready, item, filename)
         if os.path.isfile(ready_path) and os.path.getsize(ready_path) == size:
             return {"id": uid, "offset": size, "complete": True, "chunk_size": self.s.chunk}
 
-        part, meta_path = self.upload_paths(uid)
-        with self.lock_for(uid):
+        part, meta_path = self.upload_paths(sc, uid)
+        with self.lock_for(sc.tenant + ":" + uid):
             offset = os.path.getsize(part) if os.path.exists(part) else 0
             if offset > size:
                 os.truncate(part, 0)
                 offset = 0
             need = (size - offset) + (size if ext == "ova" and self.s.ova_extract else 0)
-            free = self.free_bytes()
+            if sc.quota:
+                used = tree_size(sc.lib_root, sc.staging)
+                if used + need > sc.quota:
+                    raise ApiError(507, "%s would exceed this tenant's storage quota: %s of %s is used and the "
+                                   "upload needs %s more. Delete items or ask the provider for a larger quota."
+                                   % (filename, human(used), human(sc.quota), human(need)))
+            free = self.free_bytes(sc)
             if free - need < self.s.reserve:
                 raise ApiError(507, "Not enough space for %s: it needs %.1f GiB and %.1f GiB is free after the "
                                "%.0f GiB reserve (MIN_FREE_SPACE_GB)." % (filename, need / (1 << 30),
@@ -340,22 +483,23 @@ class Portal:
                     json.dump({"item": item, "filename": filename, "size": size, "user": user,
                                "created": int(time.time())}, fh)
             open(part, "ab").close()
-        log.info("upload-init user=%s item=%s file=%s size=%d offset=%d", user, item, filename, size, offset)
+        log.info("upload-init tenant=%s user=%s item=%s file=%s size=%d offset=%d",
+                 sc.label, user, item, filename, size, offset)
         return {"id": uid, "offset": offset, "complete": False, "chunk_size": self.s.chunk}
 
-    def upload_chunk(self, uid, start, end, total, length, rfile, user):
-        meta = self.load_meta(uid)
+    def upload_chunk(self, sc, uid, start, end, total, length, rfile, user):
+        meta = self.load_meta(sc, uid)
         if not meta:
             raise ApiError(404, "Unknown upload; start it again.", drain=True)
         if total != meta["size"] or end >= total or length != end - start + 1:
             raise ApiError(400, "Content-Range does not match the upload.", drain=True)
         if length > self.s.chunk:
             raise ApiError(413, "Chunks are limited to %d MiB." % (self.s.chunk >> 20), drain=True)
-        lock = self.lock_for(uid)
+        lock = self.lock_for(sc.tenant + ":" + uid)
         if not lock.acquire(blocking=False):
             raise ApiError(409, "%s is already uploading from another window." % meta["filename"], drain=True)
         try:
-            part = self.upload_paths(uid)[0]
+            part = self.upload_paths(sc, uid)[0]
             if not os.path.exists(part):
                 raise ApiError(404, "Unknown upload; start it again.", drain=True)
             current = os.path.getsize(part)
@@ -370,12 +514,12 @@ class Portal:
             if start == 0 or complete:
                 reason = V.sniff(part, ext, offset, complete)
                 if reason:
-                    self._discard(uid)
-                    log.warning("upload-rejected user=%s item=%s file=%s reason=%s",
-                                user, meta["item"], meta["filename"], reason)
+                    self._discard(sc, uid)
+                    log.warning("upload-rejected tenant=%s user=%s item=%s file=%s reason=%s",
+                                sc.label, user, meta["item"], meta["filename"], reason)
                     raise ApiError(422, "%s was rejected because %s." % (meta["filename"], reason))
             if complete:
-                self._finalize(uid, meta, part, user)
+                self._finalize(sc, uid, meta, part, user)
             return {"offset": offset, "complete": complete}
         finally:
             lock.release()
@@ -397,41 +541,42 @@ class Portal:
                 written += n
         return written
 
-    def _finalize(self, uid, meta, part, user):
+    def _finalize(self, sc, uid, meta, part, user):
         with open(part, "rb") as fh:
             os.fsync(fh.fileno())
-        dest = os.path.join(self.ready, meta["item"])
+        dest = os.path.join(sc.ready, meta["item"])
         os.makedirs(dest, mode=0o750, exist_ok=True)
         os.replace(part, os.path.join(dest, meta["filename"]))
-        os.unlink(self.upload_paths(uid)[1])
-        log.info("upload-complete user=%s item=%s file=%s size=%d", user, meta["item"], meta["filename"], meta["size"])
+        os.unlink(self.upload_paths(sc, uid)[1])
+        log.info("upload-complete tenant=%s user=%s item=%s file=%s size=%d",
+                 sc.label, user, meta["item"], meta["filename"], meta["size"])
 
-    def _discard(self, uid):
-        for path in self.upload_paths(uid):
+    def _discard(self, sc, uid):
+        for path in self.upload_paths(sc, uid):
             try:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
 
-    def upload_cancel(self, uid, user):
-        with self.lock_for(uid):
-            meta = self.load_meta(uid) or {}
-            self._discard(uid)
-        log.info("upload-cancel user=%s item=%s file=%s", user, meta.get("item"), meta.get("filename"))
+    def upload_cancel(self, sc, uid, user):
+        with self.lock_for(sc.tenant + ":" + uid):
+            meta = self.load_meta(sc, uid) or {}
+            self._discard(sc, uid)
+        log.info("upload-cancel tenant=%s user=%s item=%s file=%s", sc.label, user, meta.get("item"), meta.get("filename"))
         return {"cancelled": uid}
 
-    def staged_discard(self, item, user):
+    def staged_discard(self, sc, item, user):
         self.check_item(item)
-        shutil.rmtree(os.path.join(self.ready, item), ignore_errors=True)
-        log.info("staged-discard user=%s item=%s", user, item)
+        shutil.rmtree(os.path.join(sc.ready, item), ignore_errors=True)
+        log.info("staged-discard tenant=%s user=%s item=%s", sc.label, user, item)
         return {"discarded": item}
 
     # -------- publish / delete (background jobs)
-    def _start_job(self, kind, item, user, target, *args):
-        lock = self.lock_for("item:" + item)
+    def _start_job(self, sc, kind, item, user, target, *args):
+        lock = self.lock_for("item:%s:%s" % (sc.tenant, item))
         if not lock.acquire(blocking=False):
             raise ApiError(409, "Another publish or delete is running for %s." % item)
-        job = Job(kind, item, user)
+        job = Job(kind, sc.tenant, item, user)
         with self._jobs_guard:
             cutoff = time.time() - 3600
             for jid in [j for j, v in self.jobs.items() if v.finished and v.finished < cutoff]:
@@ -440,7 +585,7 @@ class Portal:
 
         def runner():
             try:
-                job.finish(result=target(job, item, *args))
+                job.finish(result=target(job, sc, item, *args))
             except V.ValidationError as exc:
                 job.finish(error=str(exc))
             except Exception:
@@ -452,7 +597,7 @@ class Portal:
         threading.Thread(target=runner, name="job-" + job.id[:8], daemon=True).start()
         return job.public()
 
-    def publish(self, item, body, user):
+    def publish(self, sc, item, body, user):
         self.check_item(item)
         mode = body.get("mode", "replace")
         if mode not in ("replace", "merge"):
@@ -460,19 +605,19 @@ class Portal:
         description = None
         if "description" in body and body["description"] is not None:
             description = str(body["description"]).strip()[:2000]
-        return self._start_job("publish", item, user, self._publish, description, mode)
+        return self._start_job(sc, "publish", item, user, self._publish, description, mode)
 
-    def delete_item(self, item, user):
+    def delete_item(self, sc, item, user):
         if not self.s.allow_delete:
             raise ApiError(403, "Deleting items is disabled on this server (ALLOW_DELETE=no).")
         self.check_item(item)
-        if not os.path.isdir(os.path.join(self.s.lib_root, item)):
+        if not os.path.isdir(os.path.join(sc.lib_root, item)):
             raise ApiError(404, "%s is not in the library." % item)
-        return self._start_job("delete", item, user, self._delete)
+        return self._start_job(sc, "delete", item, user, self._delete)
 
-    def _publish(self, job, item, description, mode):
-        rdir = os.path.join(self.ready, item)
-        ldir = os.path.join(self.s.lib_root, item)
+    def _publish(self, job, sc, item, description, mode):
+        rdir = os.path.join(sc.ready, item)
+        ldir = os.path.join(sc.lib_root, item)
         exists = os.path.isdir(ldir)
         staged = self.list_files(rdir)
         if not staged and description is None:
@@ -509,7 +654,7 @@ class Portal:
 
         job.step("Publishing to the library")
         trash = None
-        with self.index_lock():
+        with self.index_lock(sc):
             if not staged:
                 self._write_meta(ldir, description)
             elif not exists:
@@ -522,7 +667,7 @@ class Portal:
                     self._write_meta(rdir, description)
                 elif os.path.isfile(old_meta):
                     shutil.copy2(old_meta, os.path.join(rdir, META_FILE))
-                trash = os.path.join(self.trash, "%s.%d.%s" % (item, time.time(), uuid.uuid4().hex[:6]))
+                trash = os.path.join(sc.trash, "%s.%d.%s" % (item, time.time(), uuid.uuid4().hex[:6]))
                 self._move(ldir, trash)
                 self._move(rdir, ldir)
             else:
@@ -536,29 +681,33 @@ class Portal:
             threading.Thread(target=shutil.rmtree, args=(trash, True), daemon=True).start()
 
         job.step("Updating the library index")
-        summary = self._run_indexer(item)
+        summary = self._run_indexer(sc, item)
         statuses = {k: v for k, v in summary.get("item_status", {}).items() if k == item or k.startswith(item + "/")}
-        problems = ["%s: %s" % (k, v["reason"]) for k, v in statuses.items() if v["status"] != "published"]
-        for p in problems:
-            job.note("Not published yet - " + p)
+        for key, info in statuses.items():
+            if info["status"] != "published":
+                job.note("Not published yet - %s: %s" % (key, info["reason"]))
         versions = sorted({str(v["version"]) for v in statuses.values() if v.get("version")})
         return {"item": item, "kind": kind, "lib_version": summary.get("lib_version"),
                 "item_versions": versions, "statuses": statuses}
 
-    def _delete(self, job, item):
-        ldir = os.path.join(self.s.lib_root, item)
-        trash = os.path.join(self.trash, "%s.%d.%s" % (item, time.time(), uuid.uuid4().hex[:6]))
+    def _delete(self, job, sc, item):
+        ldir = os.path.join(sc.lib_root, item)
+        trash = os.path.join(sc.trash, "%s.%d.%s" % (item, time.time(), uuid.uuid4().hex[:6]))
         job.step("Removing %s from the library" % item)
-        with self.index_lock():
+        with self.index_lock(sc):
             self._move(ldir, trash)
         job.step("Updating the library index")
-        summary = self._run_indexer(item)
+        summary = self._run_indexer(sc, item)
         shutil.rmtree(trash, ignore_errors=True)
         return {"item": item, "lib_version": summary.get("lib_version")}
 
-    def _move(self, src, dst):
+    @staticmethod
+    def _move(src, dst):
         try:
-            os.replace(src, dst) if os.path.isfile(src) else os.rename(src, dst)
+            if os.path.isfile(src):
+                os.replace(src, dst)
+            else:
+                os.rename(src, dst)
         except OSError as exc:
             if exc.errno != 18:  # EXDEV: staging on another filesystem
                 raise
@@ -573,43 +722,49 @@ class Portal:
         os.chmod(tmp, 0o644)
         os.replace(tmp, path)
 
-    def _run_indexer(self, item):
-        cmd = [sys.executable, self.s.index_bin, "--config", self.s.conf_path,
-               "--only", item, "--settle", "0", "--wait", "900", "--json"]
+    def _run_indexer(self, sc, item):
+        cmd = [sys.executable, self.s.index_bin, "--config", self.s.conf_path]
+        if sc.tenant != PROVIDER:
+            cmd += ["--tenant", sc.tenant]
+        cmd += ["--only", item, "--settle", "0", "--wait", "900", "--json"]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if proc.returncode not in (0, 4):
             raise V.ValidationError("The index update failed (exit %d): %s"
                                     % (proc.returncode, proc.stderr.strip()[-400:]))
         return json.loads(proc.stdout)
 
-    def job(self, jid):
+    def job(self, sc, jid):
         with self._jobs_guard:
             job = self.jobs.get(jid)
-        if not job:
+        if not job or job.tenant != sc.tenant:     # another tenant's job does not exist for you
             raise ApiError(404, "Unknown job.")
         return job.public()
 
     # -------- housekeeping
     def _janitor(self):
         while True:
-            try:
-                now = time.time()
-                for name in os.listdir(self.uploads):
-                    path = os.path.join(self.uploads, name)
-                    if name.endswith(".part") and now - os.path.getmtime(path) > self.s.ttl:
-                        self._discard(name[:-5])
-                        log.info("janitor: removed abandoned upload %s", name)
-                for item in os.listdir(self.ready):
-                    path = os.path.join(self.ready, item)
-                    if now - os.path.getmtime(path) > self.s.ttl:
-                        shutil.rmtree(path, ignore_errors=True)
-                        log.info("janitor: removed unpublished files for %s", item)
-                for name in os.listdir(self.trash):
-                    path = os.path.join(self.trash, name)
-                    if now - os.path.getmtime(path) > 600:
-                        shutil.rmtree(path, ignore_errors=True)
-            except OSError as exc:
-                log.warning("janitor: %s", exc)
+            for sc in self.scopes.all():
+                try:
+                    now = time.time()
+                    if os.path.isdir(sc.uploads):
+                        for name in os.listdir(sc.uploads):
+                            path = os.path.join(sc.uploads, name)
+                            if name.endswith(".part") and now - os.path.getmtime(path) > self.s.ttl:
+                                self._discard(sc, name[:-5])
+                                log.info("janitor: tenant=%s removed abandoned upload %s", sc.label, name)
+                    if os.path.isdir(sc.ready):
+                        for item in os.listdir(sc.ready):
+                            path = os.path.join(sc.ready, item)
+                            if now - os.path.getmtime(path) > self.s.ttl:
+                                shutil.rmtree(path, ignore_errors=True)
+                                log.info("janitor: tenant=%s removed unpublished files for %s", sc.label, item)
+                    if os.path.isdir(sc.trash):
+                        for name in os.listdir(sc.trash):
+                            path = os.path.join(sc.trash, name)
+                            if now - os.path.getmtime(path) > 600:
+                                shutil.rmtree(path, ignore_errors=True)
+                except OSError as exc:
+                    log.warning("janitor: tenant=%s %s", sc.label, exc)
             time.sleep(1800)
 
 
@@ -617,7 +772,6 @@ class Portal:
 ID = r"([0-9a-f]{32})"
 ITEM = r"([^/]{1,80})"
 ROUTES = [
-    ("GET", re.compile(r"^/api/health$"), "health"),
     ("GET", re.compile(r"^/api/config$"), "config"),
     ("GET", re.compile(r"^/api/items$"), "items"),
     ("GET", re.compile(r"^/api/uploads$"), "uploads"),
@@ -662,6 +816,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         self._body_left = int(self.headers.get("Content-Length") or 0) if method in ("POST", "PUT") else 0
         try:
+            if method == "GET" and path == "/api/health":
+                self._send(200, {"ok": True, "version": __version__})
+                return
+            key = self.headers.get("X-VCSP-Proxy-Key", "").encode()
+            if not hmac.compare_digest(key, self.portal.proxy_key):
+                raise ApiError(403, "Requests must come through the portal's web server.", drain=True)
+            sc = self.portal.scope(self.headers.get("X-VCSP-Tenant", ""))
             if method != "GET":
                 if self.headers.get("X-VCSP-Request") != "1":
                     raise ApiError(403, "Missing X-VCSP-Request header.", drain=True)
@@ -673,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
                 match = rx.match(path) if verb == method else None
                 if match:
                     args = [unquote(g) for g in match.groups()]
-                    self._send(200, getattr(self, "h_" + name)(*args))
+                    self._send(200, getattr(self, "h_" + name)(sc, *args))
                     return
             raise ApiError(404 if not any(rx.match(path) for _v, rx, _n in ROUTES) else 405,
                            "No such endpoint.", drain=True)
@@ -727,46 +888,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    # -------- handlers
-    def h_health(self):
-        return {"ok": True, "version": __version__}
+    # -------- handlers (sc = the scope nginx authenticated)
+    def h_config(self, sc):
+        return self.portal.config(sc, self._user())
 
-    def h_config(self):
-        return self.portal.config(self._user())
+    def h_items(self, sc):
+        return self.portal.items(sc)
 
-    def h_items(self):
-        return self.portal.items()
+    def h_uploads(self, sc):
+        return self.portal.uploads_list(sc)
 
-    def h_uploads(self):
-        return self.portal.uploads_list()
+    def h_upload_init(self, sc):
+        return self.portal.upload_init(sc, self._json(), self._user())
 
-    def h_upload_init(self):
-        return self.portal.upload_init(self._json(), self._user())
-
-    def h_upload_chunk(self, uid):
+    def h_upload_chunk(self, sc, uid):
         match = RANGE_RE.match(self.headers.get("Content-Range", ""))
         if not match or "Content-Length" not in self.headers:
             raise ApiError(400, "PUT needs Content-Length and Content-Range: bytes start-end/total.", drain=True)
         start, end, total = (int(x) for x in match.groups())
-        length = self._body_left
-        result = self.portal.upload_chunk(uid, start, end, total, length, self.rfile, self._user())
+        result = self.portal.upload_chunk(sc, uid, start, end, total, self._body_left, self.rfile, self._user())
         self._body_left = 0
         return result
 
-    def h_upload_cancel(self, uid):
-        return self.portal.upload_cancel(uid, self._user())
+    def h_upload_cancel(self, sc, uid):
+        return self.portal.upload_cancel(sc, uid, self._user())
 
-    def h_staged_discard(self, item):
-        return self.portal.staged_discard(item, self._user())
+    def h_staged_discard(self, sc, item):
+        return self.portal.staged_discard(sc, item, self._user())
 
-    def h_publish(self, item):
-        return self.portal.publish(item, self._json(), self._user())
+    def h_publish(self, sc, item):
+        return self.portal.publish(sc, item, self._json(), self._user())
 
-    def h_delete_item(self, item):
-        return self.portal.delete_item(item, self._user())
+    def h_delete_item(self, sc, item):
+        return self.portal.delete_item(sc, item, self._user())
 
-    def h_job(self, jid):
-        return self.portal.job(jid)
+    def h_job(self, sc, jid):
+        return self.portal.job(sc, jid)
 
 
 class Server(ThreadingHTTPServer):
@@ -775,7 +932,7 @@ class Server(ThreadingHTTPServer):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="VCSP content library upload portal backend")
+    ap = argparse.ArgumentParser(description="VCSP content library upload portal backend (multi-tenant)")
     ap.add_argument("--config", default="/etc/vcsp/vcsp.conf")
     ap.add_argument("--listen", help="override UPLOAD_LISTEN")
     ap.add_argument("--port", type=int, help="override UPLOAD_PORT")
@@ -794,8 +951,9 @@ def main(argv=None):
         settings.port = args.port
     Handler.portal = Portal(settings)
     server = Server((settings.listen, settings.port), Handler)
-    log.info("vcsp-upload %s listening on %s:%d, library %s, allowed extensions: %s",
-             __version__, settings.listen, settings.port, settings.lib_root, " ".join(settings.allowed))
+    log.info("vcsp-upload %s listening on %s:%d, provider library %s, tenants under %s, allowed extensions: %s",
+             __version__, settings.listen, settings.port, os.path.join(settings.data_root, "lib"),
+             os.path.join(settings.data_root, "tenants"), " ".join(settings.allowed))
     try:
         server.serve_forever(poll_interval=1.0)
     except KeyboardInterrupt:

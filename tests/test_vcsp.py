@@ -68,11 +68,28 @@ class Env:
         self.state = os.path.join(self.tmp, "state")
         os.makedirs(self.lib)
         os.makedirs(self.state)
+        self.tenant_dir = os.path.join(self.tmp, "tenants")
+        os.makedirs(self.tenant_dir)
+        self.proxy_key = "k" * 16 + os.urandom(16).hex()
+        key_file = os.path.join(self.tmp, "proxy.key")
+        with open(key_file, "w") as fh:
+            fh.write(self.proxy_key + "\n")
         self.conf = os.path.join(self.tmp, "vcsp.conf")
         with open(self.conf, "w") as fh:
             fh.write('LIB_NAME="Test Library"\nSERVER_FQDN="vcsp.test.local"\nDATA_ROOT="%s"\nSTATE_DIR="%s"\n'
                      'INDEX_BIN="%s"\nUPLOAD_CHUNK_MB="1"\nMIN_FREE_SPACE_GB="0"\nSETTLE_SECONDS="0"\n'
-                     % (self.data, self.state, INDEX))
+                     'TENANT_CONF_DIR="%s"\nPROXY_KEY_FILE="%s"\n'
+                     % (self.data, self.state, INDEX, self.tenant_dir, key_file))
+
+    def add_tenant(self, name, display=None, quota_gb=0, state="active"):
+        """What 'deploy.sh tenant-add' creates, minus nginx and passwords."""
+        os.makedirs(os.path.join(self.tenant_dir, name), exist_ok=True)
+        with open(os.path.join(self.tenant_dir, name, "tenant.conf"), "w") as fh:
+            fh.write('TENANT_NAME="%s"\nTENANT_DISPLAY_NAME="%s"\nTENANT_QUOTA_GB="%s"\nTENANT_STATE="%s"\n'
+                     % (name, display or name, quota_gb, state))
+        for sub in ("lib", "staging"):
+            os.makedirs(os.path.join(self.data, "tenants", name, sub), exist_ok=True)
+        os.makedirs(os.path.join(self.state, "tenants", name), exist_ok=True)
 
     def index(self, *extra):
         out = subprocess.run([sys.executable, INDEX, "--config", self.conf, "--json"] + list(extra),
@@ -81,8 +98,9 @@ class Env:
             raise AssertionError(out.stderr)
         return json.loads(out.stdout)
 
-    def lib_json(self, name="lib.json"):
-        with open(os.path.join(self.lib, name)) as fh:
+    def lib_json(self, name="lib.json", tenant=None):
+        root = self.lib if tenant is None else os.path.join(self.data, "tenants", tenant, "lib")
+        with open(os.path.join(root, name)) as fh:
             return json.load(fh)
 
     def cleanup(self):
@@ -204,9 +222,10 @@ class ServiceTests(unittest.TestCase):
         cls.env.cleanup()
 
     @classmethod
-    def call(cls, method, path, body=None, headers=None, raw=None):
+    def call(cls, method, path, body=None, headers=None, raw=None, tenant="_provider"):
         conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=30)
-        hdrs = {"X-VCSP-Request": "1", "X-Remote-User": "tester"}
+        hdrs = {"X-VCSP-Request": "1", "X-Remote-User": "tester",
+                "X-VCSP-Proxy-Key": cls.env.proxy_key, "X-VCSP-Tenant": tenant}
         hdrs.update(headers or {})
         payload = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         if payload is not None and "Content-Type" not in hdrs:
@@ -217,13 +236,14 @@ class ServiceTests(unittest.TestCase):
         conn.close()
         return resp.status, data
 
-    def upload(self, item, name, data):
-        status, init = self.call("POST", "/api/uploads", {"item": item, "filename": name, "size": len(data)})
-        self.assertEqual(status, 200, init)
+    def upload(self, item, name, data, tenant="_provider"):
+        status, init = self.call("POST", "/api/uploads", {"item": item, "filename": name, "size": len(data)}, tenant=tenant)
+        if status != 200:
+            return status, init
         offset, chunk = init["offset"], init["chunk_size"]
         while offset < len(data):
             part = data[offset:offset + chunk]
-            status, res = self.call("PUT", "/api/uploads/" + init["id"], raw=part, headers={
+            status, res = self.call("PUT", "/api/uploads/" + init["id"], raw=part, tenant=tenant, headers={
                 "Content-Type": "application/octet-stream",
                 "Content-Range": "bytes %d-%d/%d" % (offset, offset + len(part) - 1, len(data))})
             if status != 200:
@@ -231,15 +251,24 @@ class ServiceTests(unittest.TestCase):
             offset = res["offset"]
         return 200, {"offset": offset}
 
-    def publish(self, item, **body):
-        status, job = self.call("POST", "/api/items/%s/publish" % item, body)
+    def publish(self, item, tenant="_provider", **body):
+        status, job = self.call("POST", "/api/items/%s/publish" % item, body, tenant=tenant)
         self.assertEqual(status, 200, job)
         for _ in range(200):
-            status, job = self.call("GET", "/api/jobs/" + job["id"])
+            status, job = self.call("GET", "/api/jobs/" + job["id"], tenant=tenant)
             if job["state"] != "running":
                 return job
             time.sleep(0.05)
         self.fail("job did not finish")
+
+    def test_00_proxy_key_and_tenant_header_required(self):
+        self.assertEqual(self.call("GET", "/api/health", headers={"X-VCSP-Proxy-Key": ""})[0], 200)
+        status, res = self.call("GET", "/api/config", headers={"X-VCSP-Proxy-Key": "wrong"})
+        self.assertEqual(status, 403)
+        self.assertIn("web server", res["error"])
+        self.assertEqual(self.call("GET", "/api/config", tenant="")[0], 404)
+        self.assertEqual(self.call("GET", "/api/config", tenant="nosuchtenant")[0], 404)
+        self.assertEqual(self.call("GET", "/api/config", tenant="../etc")[0], 404)
 
     def test_01_csrf_and_names(self):
         self.assertEqual(self.call("POST", "/api/uploads", {"item": "a"}, headers={"X-VCSP-Request": ""})[0], 403)
@@ -338,6 +367,59 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(int(self.env.lib_json()["version"]), version)
         names = {i["name"] for i in self.env.lib_json("items.json")["items"]}
         self.assertFalse({"win2022", "rhel9"} & names)
+
+    def test_09_tenant_isolation(self):
+        self.env.add_tenant("acme", "ACME Bank")
+        self.env.add_tenant("globex")
+        status, cfg = self.call("GET", "/api/config", tenant="acme")
+        self.assertEqual((cfg["tenant"], cfg["lib_name"]), ("acme", "ACME Bank"))
+        self.assertEqual(cfg["subscription_url"], "https://vcsp.test.local/tenants/acme/lib/lib.json")
+        self.assertEqual(self.upload("acme-media", "acme.iso", iso_image(), tenant="acme")[0], 200)
+        job = self.publish("acme-media", tenant="acme")
+        self.assertEqual(job["state"], "done", job)
+        # published into acme's own library with its own lib.json
+        acme_items = {i["name"] for i in self.env.lib_json("items.json", tenant="acme")["items"]}
+        self.assertEqual(acme_items, {"acme-media"})
+        self.assertNotEqual(self.env.lib_json(tenant="acme")["id"], self.env.lib_json()["id"])
+        # invisible to the provider and to other tenants
+        provider_items = {i["name"] for i in self.call("GET", "/api/items")[1]["items"]}
+        self.assertNotIn("acme-media", provider_items)
+        self.assertEqual(self.call("GET", "/api/items", tenant="globex")[1]["items"], [])
+        # another tenant cannot read, publish or delete it, or see acme's jobs
+        self.assertEqual(self.call("GET", "/api/jobs/" + job["id"], tenant="globex")[0], 404)
+        self.assertEqual(self.call("GET", "/api/jobs/" + job["id"])[0], 404)
+        self.assertEqual(self.call("DELETE", "/api/items/acme-media", tenant="globex")[0], 404)
+        # staged uploads are per tenant too
+        self.assertEqual(self.upload("shared-name", "x.iso", iso_image(), tenant="globex")[0], 200)
+        self.assertEqual(self.call("GET", "/api/uploads", tenant="acme")[1]["ready"], [])
+        self.assertEqual(self.call("DELETE", "/api/staged/shared-name", tenant="globex")[0], 200)
+
+    def test_10_tenant_quota(self):
+        self.env.add_tenant("tiny", quota_gb=0.0001)          # about 107 KB
+        status, cfg = self.call("GET", "/api/config", tenant="tiny")
+        self.assertEqual(cfg["quota_bytes"], int(0.0001 * (1 << 30)))
+        status, res = self.upload("big", "big.iso", iso_image(200 * 1024), tenant="tiny")
+        self.assertEqual(status, 507)
+        self.assertIn("quota", res["error"])
+        self.assertEqual(self.upload("small", "small.iso", iso_image(64 * 1024), tenant="tiny")[0], 200)
+
+    def test_11_suspended_tenant(self):
+        self.env.add_tenant("paused", state="suspended")
+        status, res = self.call("GET", "/api/config", tenant="paused")
+        self.assertEqual(status, 403)
+        self.assertIn("suspended", res["error"])
+
+    def test_12_index_all_skips_suspended(self):
+        self.env.add_tenant("idx-a")
+        self.env.add_tenant("idx-off", state="suspended")
+        scopes = self.env.index("--all")["scopes"]
+        self.assertIn("provider", scopes)
+        self.assertIn("idx-a", scopes)
+        self.assertNotIn("idx-off", scopes)
+        single = self.env.index("--tenant", "idx-a")
+        self.assertEqual(single["tenant"], "idx-a")
+        bad = subprocess.run([sys.executable, INDEX, "--config", self.env.conf, "--tenant", "nope"], capture_output=True)
+        self.assertEqual(bad.returncode, 3)
 
     def test_08_listing(self):
         status, cfg = self.call("GET", "/api/config")

@@ -1,6 +1,6 @@
 # VCSP external content library for VMware Cloud Director
 
-A self-hosted third-party content library on Photon OS that VMware Cloud Director catalogs and vCenter content libraries subscribe to over HTTPS. It implements the VMware Content Subscription Protocol (VCSP) endpoint described in William Lam's articles on [third-party content libraries](https://williamlam.com/2015/06/creating-your-own-3rd-party-content-library-for-vsphere-6-0-vcloud-director-5-x.html) and [content libraries on Amazon S3](https://williamlam.com/2018/07/creating-a-vsphere-content-library-directly-on-amazon-s3.html), and adds an upload portal and an incremental indexer that replaces `make_vcsp_2018.py`.
+A self-hosted third-party content library on Photon OS that VMware Cloud Director catalogs and vCenter content libraries subscribe to over HTTPS. Version 2 is multi-tenant: besides the provider library, each tenant gets its own isolated library, subscription endpoint, upload portal, administrators and optional quota, onboarded with a single `deploy.sh tenant-add` command. It implements the VMware Content Subscription Protocol (VCSP) endpoint described in William Lam's articles on [third-party content libraries](https://williamlam.com/2015/06/creating-your-own-3rd-party-content-library-for-vsphere-6-0-vcloud-director-5-x.html) and [content libraries on Amazon S3](https://williamlam.com/2018/07/creating-a-vsphere-content-library-directly-on-amazon-s3.html), and adds an upload portal and an incremental indexer that replaces `make_vcsp_2018.py`.
 
 ```
             Cloud Director cells / vCenter (subscribers, user "vcsp")
@@ -35,6 +35,7 @@ Everything runs on the Python 3 standard library and the Photon OS base reposito
 | `systemd/` | Hardened units for the backend and the indexer timer. |
 | `tests/test_vcsp.py` | End-to-end tests (`python3 tests/test_vcsp.py -v`, no root needed). |
 | `docs/portal.png` | Screenshot of the upload portal. |
+| `docs/VCSP-Content-Library-Architecture.pptx` | Architecture deck: high-level and low-level design, diagrams as editable PowerPoint shapes. |
 
 On the server the same layout is mirrored under `/opt/vcsp`, so `/opt/vcsp/deploy.sh` can be re-run for any later operation.
 
@@ -99,11 +100,13 @@ VCSP_ADMIN_USER=libadmin VCSP_ADMIN_PASSWORD='...' VCSP_LIB_PASSWORD='...' \
   ./deploy.sh install --non-interactive
 ```
 
-Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (thirteen checks covering TLS, authentication, the backend and the index, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (fourteen checks covering TLS, authentication, the backend and the index, plus four per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
 
 Photon OS ships `/srv` as a symbolic link to `/var/srv`, so with the default `DATA_ROOT=/srv/vcsp` the library physically lives in `/var/srv/vcsp/lib`. The installer resolves links in `DATA_ROOT` and `STATE_DIR` and gives nginx and systemd the real paths; links above the library are fine, but `lib/` and `staging/` themselves must be real folders or bind mounts.
 
-What the installer changes on the host: it creates the `vcsp` system user; the folders `/opt/vcsp`, `/etc/vcsp`, `DATA_ROOT` and `STATE_DIR`; `/etc/nginx/nginx.conf` (the Photon original is kept as `nginx.conf.photon-default`); three systemd units with drop-ins; a logrotate rule when nginx has none; and, with `MANAGE_FIREWALL=yes`, iptables ACCEPT rules for TCP 443 and 80, persisted in `/etc/systemd/scripts/ip4save` because Photon OS drops inbound traffic except SSH by default.
+What the installer changes on the host: it creates the `vcsp` system user; the folders `/opt/vcsp`, `/etc/vcsp` (including `tenants/` and the nginx-to-backend key `proxy.key`), `DATA_ROOT` and `STATE_DIR` (each with a `tenants/` folder); `/etc/nginx/nginx.conf` (the Photon original is kept as `nginx.conf.photon-default`); three systemd units with drop-ins; a logrotate rule when nginx has none; and, with `MANAGE_FIREWALL=yes`, iptables ACCEPT rules for TCP 443 and 80, persisted in `/etc/systemd/scripts/ip4save` because Photon OS drops inbound traffic except SSH by default.
+
+**Upgrading from 1.x.** Copy the 2.0 package to the server and run `./deploy.sh install` from it. The provider library, its URL, IDs, versions, passwords and certificate are kept, so existing subscribers see no change; the installer adds the tenant folders and the nginx-to-backend key, and restarts the services on the new code. Tenants can be onboarded immediately afterwards.
 
 ## Subscribing
 
@@ -134,6 +137,58 @@ Browse to `https://<SERVER_FQDN>/upload/` and sign in as a portal administrator.
 Files are sent in `UPLOAD_CHUNK_MB` pieces that stream straight to disk, so multi-hundred-gigabyte disks upload with constant memory and survive interruptions: after a dropped connection or a closed tab, choose the same file for the same item and the upload continues from the last byte the server holds. Each file's content is checked against its extension after the first chunk (a VMDK needs a sparse or streamOptimized header, an ISO an ISO 9660 or UDF descriptor, an OVA a tar header), so a mislabelled file is refused within seconds rather than after a long upload.
 
 Publishing runs as a background job with visible steps. OVAs are unpacked in one streaming pass that refuses links, device files, sub-folders and path traversal; the item must contain exactly one OVF whose referenced files are all present with their declared sizes; and when a manifest is present, every SHA1/SHA256/SHA512 digest is verified in parallel (`VERIFY_MANIFEST`). Only then are the files moved into the library, under the same lock the indexer uses, and that single item is re-indexed. For an existing item, "Replace all of its files" swaps the whole folder atomically; "Add or overwrite individual files" merges, which suits adding ISOs to a media folder.
+
+## Multi-tenancy
+
+Every tenant is a separate library with its own subscription endpoint, upload portal, portal administrators, subscription password, index state and optional storage quota. The original library keeps running unchanged as the **provider library**, so existing subscribers are not affected by an upgrade.
+
+| | Provider library | Tenant `acme` |
+|---|---|---|
+| Subscription URL | `https://<fqdn>/lib/lib.json` | `https://<fqdn>/tenants/acme/lib/lib.json` |
+| Upload portal | `https://<fqdn>/upload/` | `https://<fqdn>/tenants/acme/upload/` |
+| Library folder | `DATA_ROOT/lib` | `DATA_ROOT/tenants/acme/lib` |
+| Index state | `STATE_DIR` | `STATE_DIR/tenants/acme` |
+| Settings and passwords | `/etc/vcsp/htpasswd-*` | `/etc/vcsp/tenants/acme/` (`tenant.conf`, `htpasswd-admin`, `htpasswd-library`) |
+
+In Cloud Director the usual mapping is one tenant per organization: the organization's catalog subscribes to its own tenant URL with its own library password, so it can neither see nor read another organization's templates.
+
+**Onboarding.** One command creates the folders, configuration, passwords and nginx locations, reloads nginx, builds the empty library and checks it end to end. It prompts for the tenant administrator's user name and password (required, 12 characters or more, entered twice) and for the library password subscribers will use (press Enter to have one generated):
+
+```bash
+/opt/vcsp/deploy.sh tenant-add acme --display "ACME Bank" --quota-gb 500
+#   Administrator user name for tenant acme: acme-admin
+#   Password for acme-admin (12+ characters): ********
+#   Library password for subscribers of acme (user name is always 'vcsp'): ********
+#   PASS  tenant acme: lib.json without credentials returns 401
+#   PASS  tenant acme: lib.json as user vcsp returns 200
+#   PASS  tenant acme: portal API answers for acme-admin
+#   PASS  tenant acme: provider administrators are refused
+#   Tenant acme is ready
+```
+
+For automation, pass the values through the environment; a generated library password is written to `/root/vcsp-tenant-NAME-credentials.txt` (mode 0600):
+
+```bash
+VCSP_TENANT_ADMIN_PASSWORD='...' VCSP_TENANT_LIB_PASSWORD='...' \
+  /opt/vcsp/deploy.sh tenant-add acme --admin acme-admin --display "ACME Bank" --non-interactive
+```
+
+Tenant names use 3-32 lowercase letters, digits and hyphens (they appear in URLs). Optional `--lib-allow` and `--admin-allow` restrict the tenant's library and portal to given addresses or CIDRs, and `--quota-gb` caps the tenant's library plus staging (the default is `TENANT_DEFAULT_QUOTA_GB`, 0 meaning unlimited). If any step fails, everything created so far is removed again, so a failed onboarding never leaves a half-configured tenant.
+
+**Managing tenants.**
+
+| Command | Effect |
+|---|---|
+| `tenant-list` | All tenants with state, administrator count, published items, size and quota. |
+| `tenant-show NAME` | Settings, URLs, administrators, library folder and item states. |
+| `tenant-update NAME --display ... --quota-gb ... --lib-allow ... --admin-allow ...` | Change settings; nginx is re-tested and reloaded, with rollback on error. |
+| `tenant-add-admin NAME USER` | Add another administrator, or reset an existing one's password. |
+| `tenant-remove-admin NAME USER` | Remove an administrator (the last one cannot be removed). |
+| `tenant-set-library-password NAME` | Rotate the subscription password; update it in the tenant's subscribed catalogs. |
+| `tenant-suspend NAME` / `tenant-resume NAME` | Take the tenant's library and portal offline (404) without touching its content, and bring them back. |
+| `tenant-remove NAME [--keep-data]` | Revoke access first, then delete the tenant; `--keep-data` moves its library to `DATA_ROOT/archive/NAME-<timestamp>`. Requires typing the name (or `VCSP_CONFIRM_REMOVE=NAME`). |
+
+**How isolation is enforced.** nginx holds one generated file per active tenant in `/etc/nginx/vcsp-tenants/`, each authenticating against that tenant's own password files, so a tenant's credentials are refused everywhere else (tested as a full matrix: every administrator and library password works only in its own scope). For API calls nginx stamps the tenant name in a header, overwriting anything the browser sends, and adds a secret key from `/etc/vcsp/proxy.key`; the backend rejects any request without that key, so local users cannot reach it around nginx. Inside the backend every path, lock, upload, job and quota is derived from that stamped tenant, and jobs of one tenant are invisible to another. Each tenant has its own library ID and version sequence, and the indexer timer (`vcsp-index --all`) processes the provider library and each active tenant with separate locks.
 
 ## Adding content without the portal
 
@@ -179,6 +234,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 | Portal | Separate administrator accounts (`add-admin`, `remove-admin`), optional `ADMIN_ALLOW_CIDRS`, rate limiting, audit lines with the user name for every upload, publish and delete in the journal. |
 | Browser | Strict Content-Security-Policy (no inline or eval script, no third-party origins), `X-Frame-Options DENY`, `nosniff`, no referrer. State-changing API calls require a custom header and a same-origin `Origin`, which blocks CSRF against cached Basic credentials. |
 | Uploads | Server-side extension allow-list, strict file and item name patterns, magic-byte checks on the first chunk, size limits, free-space reserve, OVA extraction that refuses traversal, links and devices, OVF completeness and manifest digest verification before anything reaches the library. |
+| Tenants | Separate password files, nginx locations, library, staging, index state and quota per tenant; nginx stamps the tenant on every API call and the backend accepts only requests carrying nginx's secret key; one tenant's jobs and uploads are invisible to others. |
 | Processes | Backend and indexer run as the unprivileged `vcsp` user under systemd sandboxing (`ProtectSystem=strict`, empty capability set, `NoNewPrivileges`, write access limited to `DATA_ROOT` and `STATE_DIR`; the indexer also has no network). The backend listens on loopback only and refuses to run as root. |
 | Supply chain | Standard library only; offline bundle integrity by SHA-256 and RPM signature verification. Hash functions are called with `usedforsecurity=False`, so manifest checks keep working when OpenSSL runs in FIPS mode. |
 
@@ -189,7 +245,9 @@ Useful indexer options: `--status` (list items and states from the state file), 
 /opt/vcsp/deploy.sh verify                     # re-run the deployment checks
 /opt/vcsp/deploy.sh reindex [--rebuild]        # index now (as the vcsp user)
 ./deploy.sh download-prereqs --refresh --archive   # rebuild the offline bundle with current Photon OS packages
-/opt/vcsp/deploy.sh add-admin alice            # add or reset a portal user
+/opt/vcsp/deploy.sh add-admin alice            # add or reset a provider portal user
+/opt/vcsp/deploy.sh tenant-add acme            # onboard a tenant (see Multi-tenancy)
+/opt/vcsp/deploy.sh tenant-list                # tenants, sizes and quotas
 /opt/vcsp/deploy.sh remove-admin alice
 /opt/vcsp/deploy.sh set-library-password       # then update each subscriber's password
 /opt/vcsp/deploy.sh cert-csr                   # /etc/vcsp/tls/server.csr for your CA
@@ -200,7 +258,7 @@ journalctl -u vcsp-upload -u vcsp-index -f     # audit trail and index runs
 
 After editing `/etc/vcsp/vcsp.conf`, run `/opt/vcsp/deploy.sh install` again; it is idempotent, keeps existing certificates and passwords, and re-renders nginx and systemd from the new values.
 
-For backup, protect `DATA_ROOT/lib` (the content), `/var/lib/vcsp/state.json` (IDs, versions and cached etags) and `/etc/vcsp` (configuration, password hashes, TLS key). If the state file is lost, the indexer re-adopts IDs and versions from `items.json`, so subscribers are not disturbed. For monitoring, alert on `vcsp-index --check` returning 4, on `systemctl is-active vcsp-upload nginx`, and on free space in `DATA_ROOT`.
+For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libraries in `tenants/`), `STATE_DIR` (IDs, versions and cached etags for every library) and `/etc/vcsp` (configuration, tenant definitions, password hashes, TLS and proxy keys). If the state file is lost, the indexer re-adopts IDs and versions from `items.json`, so subscribers are not disturbed. For monitoring, alert on `vcsp-index --check` returning 4, on `systemctl is-active vcsp-upload nginx`, and on free space in `DATA_ROOT`.
 
 ## Configuration reference
 
@@ -212,6 +270,7 @@ For backup, protect `DATA_ROOT/lib` (the content), `/var/lib/vcsp/state.json` (I
 | `DATA_ROOT` | /srv/vcsp | Library (`lib/`) and staging (`staging/`), on one filesystem. |
 | `STATE_DIR` | /var/lib/vcsp | Indexer state and lock. |
 | `LIB_AUTH` | basic | `basic` (user `vcsp`) or `none`. |
+| `TENANT_DEFAULT_QUOTA_GB` | 0 | Quota for new tenants when `tenant-add` gets no `--quota-gb` (0 = unlimited). |
 | `LIB_ALLOW_CIDRS` / `ADMIN_ALLOW_CIDRS` | empty | Space-separated addresses or CIDRs allowed to reach `/lib/` or the portal. |
 | `ALLOWED_EXTENSIONS` | ovf vmdk mf cert nvram iso ova | Upload allow-list. |
 | `UPLOAD_CHUNK_MB` | 64 | Size of each resumable upload request (1-512). |
@@ -244,6 +303,10 @@ For backup, protect `DATA_ROOT/lib` (the content), `/var/lib/vcsp/state.json` (I
 **Subscribers re-download everything after maintenance.** In `stat` mode, anything that rewrites file timestamps changes etags. Preserve timestamps (`rsync -a`, `cp -p`) or switch to a content `ETAG_MODE` with `--force` once.
 
 **nginx does not start after enabling IPv6.** The host kernel has IPv6 disabled; set `LISTEN_IPV6=no` and re-run the installer.
+
+**A portal shows "Requests must come through the portal's web server".** The backend and nginx disagree on the proxy key, usually because the backend was restarted with an old key or the key file was edited. Re-run `/opt/vcsp/deploy.sh install`, which rewrites the nginx include from `/etc/vcsp/proxy.key` and restarts the backend.
+
+**A tenant URL returns 404.** The tenant does not exist or is suspended; check `deploy.sh tenant-list`.
 
 **Upload portal returns 413 or 502.** Check that `UPLOAD_CHUNK_MB` was applied by re-running the installer, and read `journalctl -u vcsp-upload`.
 

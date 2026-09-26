@@ -105,7 +105,7 @@
     $("#lib-name").textContent = c.lib_name;
     $("#sub-url").value = c.subscription_url;
     $("#lib-auth").textContent = c.lib_auth === "basic"
-      ? "Subscribers sign in as vcsp with the library password"
+      ? `Subscribers sign in as vcsp with ${c.tenant ? "this tenant's" : "the"} library password`
       : "Subscribers connect without a password";
     const exts = c.allowed_extensions.map((e) => "." + e);
     $("#drop-types").textContent =
@@ -113,6 +113,13 @@
       (c.ova_extract ? "OVA files are unpacked into OVF templates." : "");
     $("#file-input").setAttribute("accept", exts.join(","));
     setVersion(c.lib_version);
+    setQuota(c);
+  }
+
+  function setQuota(c) {
+    $("#lib-quota").textContent = c.quota_bytes
+      ? `Storage: ${fmtBytes(c.used_bytes)} of ${fmtBytes(c.quota_bytes)} used`
+      : "";
   }
 
   function setVersion(v) {
@@ -137,7 +144,11 @@
 
   async function refreshAll() {
     try {
-      await Promise.all([loadItems(), loadPending()]);
+      await Promise.all([
+        loadItems(),
+        loadPending(),
+        S.config && S.config.quota_bytes ? api("config").then(setQuota) : null,
+      ]);
     } catch (e) {
       toast(e.message, true);
     }

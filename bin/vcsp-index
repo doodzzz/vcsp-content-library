@@ -20,6 +20,8 @@ What makes it fast compared with the reference script:
     computed only for new or changed files, in parallel, with sequential
     read-ahead and page-cache eviction hints.
   * --only ITEM re-indexes a single item folder (used by the upload portal).
+  * Multi-tenant: --tenant NAME indexes one tenant's library, --all indexes the
+    provider library and every active tenant, each with its own state and lock.
 
 Correctness guarantees:
   * IDs are stable for the life of an item, versions only ever increase
@@ -41,6 +43,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import time
 import uuid
@@ -48,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 VCSP_VERSION = "2"
 ISO_FORMAT = "%Y-%m-%dT%H:%MZ"
@@ -69,6 +72,8 @@ DEFAULT_CONF = "/etc/vcsp/vcsp.conf"
 SAFE_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 EXIT_OK, EXIT_ERROR, EXIT_LOCKED, EXIT_CONFIG, EXIT_CHECK = 0, 1, 2, 3, 4
+PROVIDER = "_provider"                                  # the original, non-tenant library
+TENANT_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
 
 log = logging.getLogger("vcsp-index")
 
@@ -295,6 +300,49 @@ def ovf_problems(info, files):
 
 
 # --------------------------------------------------------------------------
+# tenants
+# --------------------------------------------------------------------------
+def tenant_conf_dir(conf):
+    return conf.get("TENANT_CONF_DIR", "/etc/vcsp/tenants")
+
+
+def list_tenants(conf, include_suspended=False):
+    """Tenant names registered under TENANT_CONF_DIR (<name>/tenant.conf)."""
+    base = tenant_conf_dir(conf)
+    try:
+        names = sorted(os.listdir(base))
+    except FileNotFoundError:
+        return []
+    out = []
+    for name in names:
+        path = os.path.join(base, name, "tenant.conf")
+        if TENANT_RE.match(name) and os.path.isfile(path):
+            if include_suspended or read_conf(path).get("TENANT_STATE", "active") == "active":
+                out.append(name)
+    return out
+
+
+def scope_for(conf, tenant):
+    """Library root, state folder and display name for the provider library or a tenant."""
+    data_root = conf.get("DATA_ROOT", "/srv/vcsp")
+    state_dir = conf.get("STATE_DIR", "/var/lib/vcsp")
+    if tenant in (None, PROVIDER):
+        return {"tenant": PROVIDER, "label": "provider",
+                "lib_root": conf.get("LIBRARY_ROOT") or os.path.join(data_root, "lib"),
+                "state_dir": state_dir, "lib_name": conf.get("LIB_NAME", "VCSP Content Library")}
+    if not TENANT_RE.match(tenant):
+        raise ValueError("%r is not a valid tenant name" % tenant)
+    path = os.path.join(tenant_conf_dir(conf), tenant, "tenant.conf")
+    if not os.path.isfile(path):
+        raise ValueError("tenant %s does not exist (no %s)" % (tenant, path))
+    tconf = read_conf(path)
+    return {"tenant": tenant, "label": tenant,
+            "lib_root": os.path.join(data_root, "tenants", tenant, "lib"),
+            "state_dir": os.path.join(state_dir, "tenants", tenant),
+            "lib_name": tconf.get("TENANT_DISPLAY_NAME") or tenant}
+
+
+# --------------------------------------------------------------------------
 # indexer
 # --------------------------------------------------------------------------
 class Candidate:
@@ -321,12 +369,12 @@ class Candidate:
 
 
 class Indexer:
-    def __init__(self, conf, args):
-        data_root = conf.get("DATA_ROOT", "/srv/vcsp")
-        self.lib_root = os.path.abspath(args.library or conf.get("LIBRARY_ROOT")
-                                        or os.path.join(data_root, "lib"))
-        self.state_dir = os.path.abspath(args.state_dir or conf.get("STATE_DIR", "/var/lib/vcsp"))
-        self.lib_name = args.name or conf.get("LIB_NAME", "VCSP Content Library")
+    def __init__(self, conf, args, scope=None):
+        scope = scope or scope_for(conf, None)
+        self.scope = scope
+        self.lib_root = os.path.abspath(args.library or scope["lib_root"])
+        self.state_dir = os.path.abspath(args.state_dir or scope["state_dir"])
+        self.lib_name = args.name or scope["lib_name"]
         self.etag_mode = (args.etag or conf.get("ETAG_MODE", "stat")).lower()
         if self.etag_mode not in ETAG_MODES:
             raise ValueError("ETAG_MODE must be one of %s" % ", ".join(ETAG_MODES))
@@ -856,6 +904,8 @@ def parse_args(argv):
     p.add_argument("--settle", type=int, help="seconds a file must be unchanged before it is published")
     p.add_argument("--workers", type=int, help="parallel hashing threads for md5/sha256 etags")
     p.add_argument("--only", metavar="ITEM", help="re-index a single top-level item folder")
+    p.add_argument("--tenant", metavar="NAME", help="work on a tenant's library instead of the provider library")
+    p.add_argument("--all", action="store_true", help="index the provider library and every active tenant")
     p.add_argument("--wait", type=int, default=0, metavar="SECONDS",
                    help="wait this long for a concurrent run to finish (default: fail at once)")
     p.add_argument("--rebuild", action="store_true",
@@ -871,43 +921,77 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
+def print_summary(summary, prefix=""):
+    c = summary["items"]
+    print("%slib v%s%s | %d published, %d waiting, %d incomplete, %d stale | +%d ~%d -%d | %d unchanged | %.3fs%s"
+          % (prefix, summary["lib_version"], " (new)" if summary["lib_changed"] else "",
+             c["published"], c["deferred"], c["incomplete"], c["stale"],
+             len(summary["added"]), len(summary["updated"]), len(summary["removed"]),
+             summary["unchanged"], summary["elapsed_seconds"],
+             " [dry run]" if summary["dry_run"] else ""))
+    for key, info in sorted(summary["item_status"].items()):
+        if info["status"] != "published":
+            print("%s  %-9s %s: %s" % (prefix, info["status"], key, info["reason"]))
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s", stream=sys.stderr)
     conf = read_conf(args.config)
-    try:
-        indexer = Indexer(conf, args)
-    except ValueError as exc:
-        log.error("%s", exc)
+    if args.all and args.tenant:
+        log.error("use either --tenant or --all")
         return EXIT_CONFIG
-    if args.status:
-        return print_status(indexer)
-    try:
-        summary = indexer.run()
-    except LockBusy:
-        log.error("another vcsp-index run holds %s; use --wait SECONDS to queue", indexer.lock_path)
-        return EXIT_LOCKED
-    except (ValueError, FileNotFoundError) as exc:
-        log.error("%s", exc)
+    if (args.all or args.tenant) and (args.library or args.state_dir or args.name):
+        log.error("--library, --state-dir and --name cannot be combined with --tenant or --all")
+        return EXIT_CONFIG
+    if args.all and args.only:
+        log.error("--only needs a single library; combine it with --tenant, not --all")
         return EXIT_CONFIG
 
-    if args.json:
-        print(json.dumps(summary, indent=2))
-    else:
-        c = summary["items"]
-        print("lib v%s%s | %d published, %d waiting, %d incomplete, %d stale | +%d ~%d -%d | %d unchanged | %.3fs%s"
-              % (summary["lib_version"], " (new)" if summary["lib_changed"] else "",
-                 c["published"], c["deferred"], c["incomplete"], c["stale"],
-                 len(summary["added"]), len(summary["updated"]), len(summary["removed"]),
-                 summary["unchanged"], summary["elapsed_seconds"],
-                 " [dry run]" if summary["dry_run"] else ""))
-        for key, info in sorted(summary["item_status"].items()):
-            if info["status"] != "published":
-                print("  %-9s %s: %s" % (info["status"], key, info["reason"]))
-    if args.check and (summary["incomplete"] or summary["stale"] or summary["deferred"]):
-        return EXIT_CHECK
-    return EXIT_OK
+    targets = [None] + list_tenants(conf) if args.all else [args.tenant]
+    multi = args.all or bool(args.tenant)
+    rc, results = EXIT_OK, {}
+    for target in targets:
+        try:
+            scope = scope_for(conf, target)
+            indexer = Indexer(conf, args, scope)
+        except ValueError as exc:
+            log.error("%s", exc)
+            rc = rc or EXIT_CONFIG
+            continue
+        prefix = "[%s] " % scope["label"] if multi else ""
+        if args.status:
+            if multi:
+                print(prefix.strip())
+            print_status(indexer)
+            continue
+        if args.all and not os.path.isdir(indexer.lib_root):
+            log.warning("%sskipped: %s does not exist", prefix, indexer.lib_root)
+            continue
+        try:
+            summary = indexer.run()
+        except LockBusy:
+            log.error("%sanother vcsp-index run holds %s; use --wait SECONDS to queue", prefix, indexer.lock_path)
+            rc = rc or EXIT_LOCKED
+            continue
+        except (ValueError, FileNotFoundError) as exc:
+            log.error("%s%s", prefix, exc)
+            rc = rc or EXIT_CONFIG
+            continue
+        summary["tenant"] = scope["tenant"]
+        results[scope["label"]] = summary
+        if not args.json:
+            print_summary(summary, prefix)
+        if args.check and (summary["incomplete"] or summary["stale"] or summary["deferred"]):
+            rc = rc or EXIT_CHECK
+
+    if args.json and not args.status:
+        if args.all:
+            print(json.dumps({"scopes": results}, indent=2))
+        elif results:
+            print(json.dumps(next(iter(results.values())), indent=2))
+    return rc
 
 
 if __name__ == "__main__":
