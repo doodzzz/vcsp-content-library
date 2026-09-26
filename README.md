@@ -73,7 +73,7 @@ vi config/vcsp.conf                     # SERVER_FQDN, LIB_NAME, allow-lists
 ./deploy.sh install
 ```
 
-Online installs use the same path as offline ones: `download_prerequisites` fetches the RPMs into `/var/cache/vcsp/bundle`, the bundle is checksum- and signature-verified, and packages are installed from it. If that download fails, the installer falls back to a plain `tdnf install`.
+Prerequisites are only fetched when something is missing. The installer first checks which of the required packages are already installed: if none are missing it skips the download and installation entirely, otherwise it installs only the missing ones. Online installs use the same path as offline ones: `download_prerequisites` fills `/var/cache/vcsp/bundle`, the bundle is checksum- and signature-verified, and the missing packages are installed from it. A bundle that is already complete is reused rather than downloaded again. If the download fails, the installer falls back to a plain `tdnf install` of the missing packages.
 
 **Air-gapped install.** On any internet-connected Photon OS host of the same major version, build the bundle, then carry the archive across:
 
@@ -88,6 +88,8 @@ tar -xzf vcsp-offline-bundle-photon5.tar.gz
 vcsp-offline-bundle-photon5/payload/deploy.sh install      # bundle is detected automatically
 ```
 
+Re-running `download-prereqs` reuses an existing bundle when it is complete and intact: built for the same Photon OS release and package list, every required package present, and every RPM and metadata file matching its checksum. In that case only the project copy and checksums are refreshed. It downloads again only when something is missing or damaged (the log states which), or when you ask for newer package versions with `--refresh`; it reminds you to refresh when the RPMs are older than 30 days (`VCSP_BUNDLE_MAX_AGE_DAYS`). Downloads go to a scratch folder and replace the old RPMs only after they succeed, so a failed or interrupted download never destroys a working bundle.
+
 `download_prerequisites` uses `tdnf install --downloadonly --alldeps`, which ignores the local RPM database, so the bundle carries the complete dependency closure of `nginx python3 python3-xml openssl iptables curl tar gzip util-linux shadow findutils logrotate` even when the download host already has some of them. Before installing, the bundle's `SHA256SUMS` are checked and every RPM signature is verified with `rpm -K` against the VMware keys shipped in `/etc/pki/rpm-gpg`; installation then resolves only from the bundle (`tdnf --repofrompath=vcsp-bundle,... --repo=vcsp-bundle`).
 
 **Non-interactive install** (pipelines, Ansible):
@@ -97,7 +99,9 @@ VCSP_ADMIN_USER=libadmin VCSP_ADMIN_PASSWORD='...' VCSP_LIB_PASSWORD='...' \
   ./deploy.sh install --non-interactive
 ```
 
-Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (twelve checks covering TLS, authentication, the backend and the index) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (thirteen checks covering TLS, authentication, the backend and the index, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+
+Photon OS ships `/srv` as a symbolic link to `/var/srv`, so with the default `DATA_ROOT=/srv/vcsp` the library physically lives in `/var/srv/vcsp/lib`. The installer resolves links in `DATA_ROOT` and `STATE_DIR` and gives nginx and systemd the real paths; links above the library are fine, but `lib/` and `staging/` themselves must be real folders or bind mounts.
 
 What the installer changes on the host: it creates the `vcsp` system user; the folders `/opt/vcsp`, `/etc/vcsp`, `DATA_ROOT` and `STATE_DIR`; `/etc/nginx/nginx.conf` (the Photon original is kept as `nginx.conf.photon-default`); three systemd units with drop-ins; a logrotate rule when nginx has none; and, with `MANAGE_FIREWALL=yes`, iptables ACCEPT rules for TCP 443 and 80, persisted in `/etc/systemd/scripts/ip4save` because Photon OS drops inbound traffic except SSH by default.
 
@@ -171,7 +175,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 | Area | Control |
 |---|---|
 | Transport | TLS 1.2/1.3 only, modern AEAD ciphers, HSTS. Self-signed certificate plus CSR on first install; `cert-install` swaps in a CA-signed one with key-match and SAN checks and automatic rollback. |
-| Subscribers | HTTP Basic user `vcsp` (VCSP requirement) with a SHA-512-crypt password hash; optional `LIB_ALLOW_CIDRS`; `/lib/` allows only GET/HEAD, no directory listing, no symlinks, no dot-files. |
+| Subscribers | HTTP Basic user `vcsp` (VCSP requirement) with a SHA-512-crypt password hash; optional `LIB_ALLOW_CIDRS`; `/lib/` allows only GET/HEAD, no directory listing, no symbolic links inside the library, no dot-files. |
 | Portal | Separate administrator accounts (`add-admin`, `remove-admin`), optional `ADMIN_ALLOW_CIDRS`, rate limiting, audit lines with the user name for every upload, publish and delete in the journal. |
 | Browser | Strict Content-Security-Policy (no inline or eval script, no third-party origins), `X-Frame-Options DENY`, `nosniff`, no referrer. State-changing API calls require a custom header and a same-origin `Origin`, which blocks CSRF against cached Basic credentials. |
 | Uploads | Server-side extension allow-list, strict file and item name patterns, magic-byte checks on the first chunk, size limits, free-space reserve, OVA extraction that refuses traversal, links and devices, OVF completeness and manifest digest verification before anything reaches the library. |
@@ -184,6 +188,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 /opt/vcsp/deploy.sh status                     # services, items and states, disk, URL, fingerprint
 /opt/vcsp/deploy.sh verify                     # re-run the deployment checks
 /opt/vcsp/deploy.sh reindex [--rebuild]        # index now (as the vcsp user)
+./deploy.sh download-prereqs --refresh --archive   # rebuild the offline bundle with current Photon OS packages
 /opt/vcsp/deploy.sh add-admin alice            # add or reset a portal user
 /opt/vcsp/deploy.sh remove-admin alice
 /opt/vcsp/deploy.sh set-library-password       # then update each subscriber's password
@@ -229,6 +234,8 @@ For backup, protect `DATA_ROOT/lib` (the content), `/var/lib/vcsp/state.json` (I
 ## Troubleshooting
 
 **Cloud Director reports "Unable to access URL".** The subscription URL must end in `lib.json` and return a valid descriptor. From a VCD cell run `curl -k -u vcsp https://<fqdn>/lib/lib.json`; a 401 means a wrong password, 403 means the cell's address is not in `LIB_ALLOW_CIDRS`, and a TLS error means the certificate is not trusted or does not name the FQDN.
+
+**`lib.json` returns 404 and the nginx error log shows `(20: Not a directory)`.** A folder in the library path is a symbolic link that nginx refused. `deploy.sh` 1.0.0 did not resolve Photon's `/srv -> /var/srv` link; install 1.0.1 or later and re-run `deploy.sh install`, which renders the real path. If `lib/` or `staging/` itself is a link, the installer stops and explains: set `DATA_ROOT` to the real folder or use a bind mount (`mount --bind /data/vcsp /srv/vcsp` plus an `/etc/fstab` entry).
 
 **An item stays "Waiting".** Its files changed less than `SETTLE_SECONDS` ago; the next timer run publishes it. Items published through the portal skip this delay.
 

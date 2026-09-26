@@ -6,7 +6,8 @@
 # Cloud Director catalogs and vCenter content libraries subscribe to, plus an
 # upload portal for templates and ISOs. Supported: Photon OS 4.x and 5.x.
 #
-#   ./deploy.sh download-prereqs [--dest DIR] [--archive]   build an offline bundle
+#   ./deploy.sh download-prereqs [--dest DIR] [--archive] [--refresh]
+#                                 build or update an offline bundle (reused when complete)
 #   ./deploy.sh install [--offline DIR] [--non-interactive]  install or upgrade
 #   ./deploy.sh verify | status | reindex [--rebuild]
 #   ./deploy.sh add-admin USER | remove-admin USER | set-library-password
@@ -20,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="1.0.1"
+readonly VCSP_VERSION="1.0.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -106,49 +107,174 @@ set_conf_value() {  # set_conf_value KEY VALUE (in the installed config)
 }
 
 # ----------------------------------------------------------------- prerequisites
-# Downloads every RPM needed to run all functions (web server, TLS, auth,
-# upload portal, indexer, firewall) with its complete dependency closure,
-# builds repository metadata and copies this project, so the result can be
-# carried to an air-gapped Photon OS host of the same major version.
-download_prerequisites() {
-  local dest=$1 archive=${2:-no} major
-  require_root
-  major=$(photon_major)
-  command -v tdnf >/dev/null || die "tdnf is not available"
-  info "Downloading prerequisites for Photon OS $major into $dest"
-  tdnf makecache >/dev/null 2>&1 || die "cannot reach the Photon OS repositories (proxy settings live in /etc/tdnf/tdnf.conf)"
-  rpm -q createrepo_c >/dev/null 2>&1 || tdnf install -y -q createrepo_c >/dev/null || die "cannot install createrepo_c"
+# The bundle holds every RPM needed to run all functions (web server, TLS, auth,
+# upload portal, indexer, firewall) with its complete dependency closure, plus
+# repository metadata and a copy of this project, so it can be carried to an
+# air-gapped Photon OS host of the same major version.
+#
+# Nothing is downloaded when it is not needed:
+#   * install skips download and installation when every package is installed,
+#     and otherwise installs only the missing packages;
+#   * an existing bundle is reused when it is complete and intact (same Photon
+#     release and package list, every package present, every checksum correct);
+#   * a download goes to a scratch folder and replaces the old bundle only on
+#     success, so a failed or interrupted download never destroys a good bundle.
+# Use 'download-prereqs --refresh' to fetch newer package versions on purpose.
 
-  mkdir -p "$dest"
-  rm -rf "$dest/rpms" "$dest/payload"
-  mkdir -p "$dest/rpms" "$dest/payload"
-  # --alldeps ignores the local RPM database, so the bundle holds the full
-  # closure even when this download host already has some packages installed.
-  tdnf install -y --downloadonly --alldeps --downloaddir="$dest/rpms" "${RUNTIME_PKGS[@]}" >/dev/null \
-    || die "package download failed"
-  createrepo_c -q "$dest/rpms" || die "createrepo_c failed"
+VERIFIED_BUNDLE=""            # bundle whose checksums were verified or written in this run
+BUNDLE_INCOMPLETE_REASON=""
 
-  local real_dest
+missing_packages() {  # print the RUNTIME_PKGS that are not installed on this host
+  local pkg
+  for pkg in "${RUNTIME_PKGS[@]}"; do
+    rpm -q "$pkg" >/dev/null 2>&1 || printf '%s\n' "$pkg"
+  done
+}
+
+check_python_modules() {
+  python3 -c 'import xml.etree.ElementTree, hashlib, http.server, tarfile' \
+    || die "python3 is missing standard modules (is python3-xml installed?)"
+}
+
+bundle_rpms_complete() {  # bundle_rpms_complete DIR: 0 when DIR already holds a complete, intact RPM set
+  local dir=$1 want have names pkg listed on_disk
+  BUNDLE_INCOMPLETE_REASON=""
+  if [[ ! -f $dir/BUNDLE.txt || ! -f $dir/SHA256SUMS || ! -f $dir/rpms/repodata/repomd.xml ]]; then
+    BUNDLE_INCOMPLETE_REASON="no bundle yet"
+    return 1
+  fi
+  if [[ $(sed -n 's/^photon_major=//p' "$dir/BUNDLE.txt") != "$(photon_major)" ]]; then
+    BUNDLE_INCOMPLETE_REASON="the bundle was built for another Photon OS release"
+    return 1
+  fi
+  want=$(printf '%s\n' "${RUNTIME_PKGS[@]}" | sort)
+  have=$(sed -n 's/^packages=//p' "$dir/BUNDLE.txt" | tr ' ' '\n' | sed '/^$/d' | sort)
+  if [[ $want != "$have" ]]; then
+    BUNDLE_INCOMPLETE_REASON="the list of required packages changed"
+    return 1
+  fi
+  names=$(rpm -qp --qf '%{NAME}\n' "$dir"/rpms/*.rpm 2>/dev/null | sort -u || true)
+  for pkg in "${RUNTIME_PKGS[@]}"; do
+    if ! grep -qxF "$pkg" <<< "$names"; then
+      BUNDLE_INCOMPLETE_REASON="$pkg is missing from the bundle"
+      return 1
+    fi
+  done
+  listed=$(grep -c '  rpms/[^/]*\.rpm$' "$dir/SHA256SUMS" || true)
+  on_disk=$(find "$dir/rpms" -maxdepth 1 -name '*.rpm' | wc -l)
+  if [[ $listed != "$on_disk" ]]; then
+    BUNDLE_INCOMPLETE_REASON="RPM files were added or removed after the download"
+    return 1
+  fi
+  if ! (cd "$dir" && grep '  rpms/' SHA256SUMS | sha256sum --quiet -c - >/dev/null 2>&1); then
+    BUNDLE_INCOMPLETE_REASON="an RPM or the repository metadata is damaged"
+    return 1
+  fi
+  VERIFIED_BUNDLE=$(cd "$dir" && pwd)
+}
+
+bundle_age_note() {  # warn when reused RPMs may be missing recent Photon OS updates
+  local dir=$1 created now downloaded age max=${VCSP_BUNDLE_MAX_AGE_DAYS:-30}
+  created=$(sed -n 's/^created=//p' "$dir/BUNDLE.txt")
+  now=$(date -u +%s)
+  downloaded=$(date -u -d "$created" +%s 2>/dev/null || echo "$now")
+  age=$(( (now - downloaded) / 86400 ))
+  if (( age > max )); then
+    warn "the RPMs in $dir were downloaded $age days ago; run 'deploy.sh download-prereqs --refresh' to pick up Photon OS updates"
+  fi
+}
+
+refresh_payload() {  # copy this project into DEST/payload, replacing the old copy only when complete
+  local dest=$1 real_dest
   real_dest=$(cd "$dest" && pwd)
+  rm -rf "$dest/.payload.new"
+  mkdir -p "$dest/.payload.new"
   (cd "$SCRIPT_DIR" && tar --exclude="./${real_dest#"$SCRIPT_DIR"/}" --exclude='./vcsp-offline-bundle*' \
-      --exclude='*.pyc' --exclude='__pycache__' -cf - .) | (cd "$dest/payload" && tar -xf -)
+      --exclude='*.pyc' --exclude='__pycache__' -cf - .) | (cd "$dest/.payload.new" && tar -xf -)
+  rm -rf "$dest/.payload.old"
+  if [[ -d $dest/payload ]]; then
+    mv "$dest/payload" "$dest/.payload.old"
+  fi
+  mv "$dest/.payload.new" "$dest/payload"
+  rm -rf "$dest/.payload.old"
+}
 
+write_bundle_manifest() {  # write_bundle_manifest DEST RPMS_DOWNLOADED_AT REUSE_RPM_CHECKSUMS(yes|no)
+  local dest=$1 created=$2 reuse=$3
   {
     echo "vcsp_version=$VCSP_VERSION"
-    echo "photon_major=$major"
-    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "photon_major=$(photon_major)"
+    echo "created=$created"
+    echo "payload_updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "host=$(hostname)"
     echo "packages=${RUNTIME_PKGS[*]}"
-    echo "rpm_count=$(find "$dest/rpms" -name '*.rpm' | wc -l)"
+    echo "rpm_count=$(find "$dest/rpms" -maxdepth 1 -name '*.rpm' | wc -l)"
   } > "$dest/BUNDLE.txt"
-  (cd "$dest" && find rpms payload BUNDLE.txt -type f -print0 | sort -z | xargs -0 sha256sum > "$dest/SHA256SUMS.tmp") \
-    && mv "$dest/SHA256SUMS.tmp" "$dest/SHA256SUMS"
-  info "Bundle ready: $(grep rpm_count "$dest/BUNDLE.txt" | cut -d= -f2) RPMs, $(du -sh "$dest" | cut -f1)"
+  (
+    cd "$dest"
+    if [[ $reuse == yes ]]; then
+      grep '  rpms/' SHA256SUMS            # verified moments ago by bundle_rpms_complete
+    else
+      find rpms -type f -print0 | sort -z | xargs -0 sha256sum
+    fi
+    find payload BUNDLE.txt -type f -print0 | sort -z | xargs -0 sha256sum
+  ) > "$dest/SHA256SUMS.tmp"
+  mv "$dest/SHA256SUMS.tmp" "$dest/SHA256SUMS"
+}
+
+download_prerequisites() {  # download_prerequisites DEST [ARCHIVE yes|no] [REFRESH yes|no]
+  local dest=$1 archive=${2:-no} refresh=${3:-no} major created reuse=no tmp
+  require_root
+  major=$(photon_major)
+  mkdir -p "$dest"
+  if [[ $refresh != yes ]] && bundle_rpms_complete "$dest"; then
+    created=$(sed -n 's/^created=//p' "$dest/BUNDLE.txt")
+    info "All prerequisites are already in $dest ($(find "$dest/rpms" -maxdepth 1 -name '*.rpm' | wc -l) RPMs, downloaded $created); skipping the download"
+    info "Use 'download-prereqs --refresh' to download them again"
+    bundle_age_note "$dest"
+    reuse=yes
+  else
+    if [[ $refresh == yes ]]; then
+      info "Refreshing prerequisites for Photon OS $major in $dest"
+    else
+      info "Downloading prerequisites for Photon OS $major into $dest (${BUNDLE_INCOMPLETE_REASON:-no bundle yet})"
+    fi
+    command -v tdnf >/dev/null || die "tdnf is not available"
+    tdnf makecache >/dev/null 2>&1 || die "cannot reach the Photon OS repositories (proxy settings live in /etc/tdnf/tdnf.conf)"
+    rpm -q createrepo_c >/dev/null 2>&1 || tdnf install -y -q createrepo_c >/dev/null || die "cannot install createrepo_c"
+    # Download into a scratch folder; an existing bundle is replaced only after success.
+    # --alldeps ignores the local RPM database, so the bundle holds the full closure
+    # even when this download host already has some packages installed.
+    tmp="$dest/.rpms.new"
+    rm -rf "$tmp"
+    mkdir -p "$tmp"
+    if ! tdnf install -y --downloadonly --alldeps --downloaddir="$tmp" "${RUNTIME_PKGS[@]}" >/dev/null; then
+      rm -rf "$tmp"
+      die "package download failed; the existing bundle in $dest (if any) was left unchanged"
+    fi
+    if ! createrepo_c -q "$tmp"; then
+      rm -rf "$tmp"
+      die "createrepo_c failed; the existing bundle in $dest (if any) was left unchanged"
+    fi
+    rm -rf "$dest/.rpms.old"
+    if [[ -d $dest/rpms ]]; then
+      mv "$dest/rpms" "$dest/.rpms.old"
+    fi
+    mv "$tmp" "$dest/rpms"
+    rm -rf "$dest/.rpms.old"
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fi
+
+  refresh_payload "$dest"
+  write_bundle_manifest "$dest" "$created" "$reuse"
+  VERIFIED_BUNDLE=$(cd "$dest" && pwd)
+  info "Bundle ready: $(sed -n 's/^rpm_count=//p' "$dest/BUNDLE.txt") RPMs, $(du -sh "$dest" | cut -f1)"
 
   if [[ $archive == yes ]]; then
-    local tarball
+    local real_dest tarball
+    real_dest=$(cd "$dest" && pwd)
     tarball="$(dirname "$real_dest")/$(basename "$real_dest").tar.gz"
-    tar -C "$(dirname "$real_dest")" -czf "$tarball" "$(basename "$real_dest")"
+    tar -C "$(dirname "$real_dest")" --exclude='.rpms.*' --exclude='.payload.*' -czf "$tarball" "$(basename "$real_dest")"
     sha256sum "$tarball" > "$tarball.sha256"
     info "Archive: $tarball (checksum in $tarball.sha256)"
     info "On the air-gapped host: tar -xzf $(basename "$tarball") && $(basename "$real_dest")/payload/deploy.sh install --offline \$PWD/$(basename "$real_dest")"
@@ -161,8 +287,12 @@ verify_bundle() {
   major=$(photon_major)
   bundle_major=$(sed -n 's/^photon_major=//p' "$dir/BUNDLE.txt")
   [[ $bundle_major == "$major" ]] || die "bundle is for Photon OS $bundle_major, this host runs Photon OS $major"
-  info "Verifying bundle checksums"
-  (cd "$dir" && sha256sum --quiet -c SHA256SUMS) || die "bundle checksum verification failed"
+  if [[ $(cd "$dir" && pwd) == "$VERIFIED_BUNDLE" ]]; then
+    info "Bundle checksums already verified in this run"
+  else
+    info "Verifying bundle checksums"
+    (cd "$dir" && sha256sum --quiet -c SHA256SUMS) || die "bundle checksum verification failed"
+  fi
   info "Verifying RPM signatures against the Photon OS keys"
   local key bad
   for key in /etc/pki/rpm-gpg/VMWARE-RPM-GPG-KEY*; do
@@ -176,24 +306,32 @@ verify_bundle() {
 }
 
 install_prerequisites() {
-  local bundle=${1:-}
+  local bundle=${1:-} missing=()
+  mapfile -t missing < <(missing_packages)
+  if (( ${#missing[@]} == 0 )); then
+    info "All prerequisites are already installed; skipping download and installation"
+    check_python_modules
+    return
+  fi
+  info "Missing prerequisites: ${missing[*]}"
   if [[ -z $bundle ]]; then
-    # Online: run the same download path into a local cache, then install from it,
-    # so the offline procedure is exercised on every deployment.
-    if (download_prerequisites "$BUNDLE_CACHE" no); then
+    # Online: fetch into the local cache (reused when already complete), then install
+    # from it, so the offline procedure is exercised on every deployment.
+    if (download_prerequisites "$BUNDLE_CACHE" no no); then
       bundle=$BUNDLE_CACHE
+      VERIFIED_BUNDLE=$(cd "$BUNDLE_CACHE" && pwd)
     else
-      warn "bundle download failed; installing directly from the Photon OS repositories"
-      tdnf install -y "${RUNTIME_PKGS[@]}" || die "package installation failed"
+      warn "bundle download failed; installing the missing packages directly from the Photon OS repositories"
+      tdnf install -y "${missing[@]}" || die "package installation failed"
+      check_python_modules
       return
     fi
   fi
   verify_bundle "$bundle"
-  info "Installing prerequisites from $bundle"
-  tdnf --repofrompath="vcsp-bundle,$bundle/rpms" --repo=vcsp-bundle --nogpgcheck install -y "${RUNTIME_PKGS[@]}" \
+  info "Installing ${missing[*]} from $bundle"
+  tdnf --repofrompath="vcsp-bundle,$bundle/rpms" --repo=vcsp-bundle --nogpgcheck install -y "${missing[@]}" \
     || die "package installation from the bundle failed"
-  python3 -c 'import xml.etree.ElementTree, hashlib, http.server, tarfile' \
-    || die "python3 is missing standard modules (is python3-xml installed?)"
+  check_python_modules
 }
 
 # ----------------------------------------------------------------- host setup
@@ -774,6 +912,9 @@ status() {
   else
     echo "Library folder: $DATA_ROOT_REAL/lib"
   fi
+  local missing
+  missing=$(missing_packages | tr '\n' ' ')
+  echo "Prerequisites: ${missing:+missing: }${missing:-all installed}"
   echo "Subscription URL: ${PUBLIC_BASE_URL:-https://$SERVER_FQDN}/lib/lib.json"
   echo "Certificate SHA-256: $(fingerprint 2>/dev/null || echo unavailable)"
 }
@@ -853,16 +994,17 @@ main() {
   shift || true
   case $cmd in
     download-prereqs)
-      local dest="" archive=no
+      local dest="" archive=no refresh=no
       while (( $# )); do
         case $1 in
           --dest) dest=${2:?--dest needs a folder}; shift 2 ;;
           --archive) archive=yes; shift ;;
+          --refresh) refresh=yes; shift ;;
           *) die "unknown option $1" ;;
         esac
       done
       [[ -n $dest ]] || dest="$PWD/vcsp-offline-bundle-photon$(photon_major)"
-      download_prerequisites "$dest" "$archive"
+      download_prerequisites "$dest" "$archive" "$refresh"
       ;;
     install)
       local offline=""
