@@ -1,0 +1,38 @@
+[Unit]
+Description=VCSP content library upload portal backend
+Documentation=file:///opt/vcsp/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vcsp
+Group=vcsp
+UMask=0022
+ExecStart=/usr/bin/python3 /opt/vcsp/app/vcsp_upload.py --config /etc/vcsp/vcsp.conf
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=8192
+# Writable paths (DATA_ROOT, STATE_DIR) come from the drop-in deploy.sh
+# writes to vcsp-upload.service.d/10-paths.conf.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

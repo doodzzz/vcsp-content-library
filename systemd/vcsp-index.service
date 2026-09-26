@@ -1,0 +1,27 @@
+[Unit]
+Description=VCSP content library index update (lib.json / items.json / item.json)
+Documentation=file:///opt/vcsp/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=vcsp
+Group=vcsp
+UMask=0022
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 /opt/vcsp/bin/vcsp-index --config /etc/vcsp/vcsp.conf --wait 300
+# Writable paths come from vcsp-index.service.d/10-paths.conf (written by deploy.sh).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=

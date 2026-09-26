@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Content library</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="plate">
+    <div class="plate-inner">
+      <div>
+        <h1 id="lib-name">Content library</h1>
+        <p class="plate-meta"><span id="lib-version">Library version not published yet</span><span id="lib-auth"></span></p>
+      </div>
+      <div>
+        <label for="sub-url" class="plate-label">Subscription URL</label>
+        <div class="url-row">
+          <input id="sub-url" class="url" readonly spellcheck="false" value="">
+          <button id="copy-url" type="button" class="btn">Copy URL</button>
+        </div>
+        <p class="hint"><span>Cloud Director: Libraries, Catalogs, New, then subscribe to an external catalog.</span>
+          <span>vCenter: Content Libraries, Create, Subscribed content library.</span></p>
+      </div>
+    </div>
+  </header>
+
+  <main class="work">
+    <section class="compose" aria-labelledby="compose-h">
+      <h2 id="compose-h">Add or update an item</h2>
+      <form id="compose" novalidate>
+        <div class="field">
+          <label for="item-name">Item name</label>
+          <input id="item-name" list="item-names" autocomplete="off" spellcheck="false" maxlength="80"
+                 aria-describedby="item-help">
+          <datalist id="item-names"></datalist>
+          <p class="field-help" id="item-help">Becomes the catalog item name. Letters, digits, dots, hyphens and underscores.</p>
+        </div>
+
+        <fieldset class="field mode" id="mode-field" hidden>
+          <legend>This item already exists</legend>
+          <label><input type="radio" name="mode" value="replace" checked> Replace all of its files</label>
+          <label><input type="radio" name="mode" value="merge"> Add or overwrite individual files</label>
+        </fieldset>
+
+        <div class="field">
+          <label for="item-desc">Description <span class="optional">(optional)</span></label>
+          <textarea id="item-desc" rows="2" maxlength="2000"></textarea>
+        </div>
+
+        <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="drop-types">
+          <p class="drop-title">Drop files here or <span class="linkish">choose files</span></p>
+          <p class="drop-types" id="drop-types">Loading allowed file types</p>
+          <input type="file" id="file-input" multiple hidden>
+        </div>
+
+        <ul class="queue" id="queue"></ul>
+
+        <div class="actions">
+          <button type="submit" id="upload-btn" class="btn primary" disabled>Upload and publish</button>
+          <button type="button" id="clear-btn" class="btn quiet" disabled>Clear</button>
+        </div>
+
+        <div class="job" id="job" hidden aria-live="polite"></div>
+      </form>
+
+      <section class="pending" id="pending" hidden aria-labelledby="pending-h">
+        <h2 id="pending-h">Unfinished work</h2>
+        <ul id="pending-list"></ul>
+      </section>
+    </section>
+
+    <section class="library" aria-labelledby="library-h">
+      <div class="library-head">
+        <h2 id="library-h">Library items <span id="item-count" class="count"></span></h2>
+        <div class="library-tools">
+          <input id="filter" type="search" placeholder="Filter by name" aria-label="Filter items by name">
+          <button id="refresh" class="btn quiet" type="button">Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="items">
+          <thead>
+            <tr>
+              <th scope="col">Name</th>
+              <th scope="col">Type</th>
+              <th scope="col" class="num">Size</th>
+              <th scope="col" class="num">Version</th>
+              <th scope="col">Status</th>
+              <th scope="col"><span class="sr">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="empty" hidden>The library is empty. Add an OVF template, an OVA or an ISO on the left;
+          it appears here and in subscribed catalogs once published.</p>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

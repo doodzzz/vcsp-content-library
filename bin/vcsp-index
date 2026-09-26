@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vcsp-index - incremental VMware Content Subscription Protocol (VCSP) indexer.
+
+Generates lib.json, items.json and <item>/item.json for a third-party content
+library that VMware Cloud Director catalogs and vCenter content libraries can
+subscribe to. The JSON schema follows make_vcsp_2018.py (lamw/vmware-scripts,
+by Eric Cao), including the S3 variant's contentVersion, generationNum,
+per-ISO media items and OVF type-metadata.
+
+What makes it fast compared with the reference script:
+  * No content reads by default. The reference hashes every file twice on
+    every run; here a file etag is derived from stat() and uses the same
+    "<mtime-hex>-<size-hex>" form nginx sends as the HTTP ETag header.
+  * Incremental. Each item's stat signature is cached in a state file, so an
+    unchanged item costs one scandir() plus one stat() per file, and no JSON
+    is built for it. Files are rewritten only when their bytes change.
+  * Optional content etags (ETAG_MODE=md5|sha256) are cached per file and
+    computed only for new or changed files, in parallel, with sequential
+    read-ahead and page-cache eviction hints.
+  * --only ITEM re-indexes a single item folder (used by the upload portal).
+
+Correctness guarantees:
+  * IDs are stable for the life of an item, versions only ever increase
+    (VCSP requirement), and existing lib.json/items.json produced by
+    make_vcsp_2018.py are adopted without forcing subscribers to resync.
+  * Writes are atomic (temp file + fsync + rename) and ordered item.json ->
+    items.json -> lib.json, so a subscriber never sees a half-updated index.
+  * OVF items are published only when every file referenced by the
+    descriptor is present with the expected size; files still being copied
+    (modified within SETTLE_SECONDS) are held back.
+
+Requires only the Python 3 standard library (plus python3-xml on Photon OS).
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import posixpath
+import sys
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from urllib.parse import quote, unquote
+
+__version__ = "1.0.0"
+
+VCSP_VERSION = "2"
+ISO_FORMAT = "%Y-%m-%dT%H:%MZ"
+LIB_FILE = "lib.json"
+ITEMS_FILE = "items.json"
+ITEM_FILE = "item.json"
+META_FILE = ".vcsp-meta.json"          # optional per-item {"description": "..."}
+TYPE_OVF = "vcsp.ovf"
+TYPE_ISO = "vcsp.iso"
+TYPE_OTHER = "vcsp.other"
+STATE_SCHEMA = 1
+NEW_ITEM_VERSION = 2                    # make_vcsp_2018.py starts items at 2
+IGNORED_SUFFIXES = (".part", ".tmp", ".partial", ".swp", "~")
+IGNORED_ROOT_DIRS = {"lost+found"}
+OVF_MAX_BYTES = 64 << 20
+ETAG_MODES = ("stat", "md5", "sha256")
+DEFAULT_CONF = "/etc/vcsp/vcsp.conf"
+SAFE_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+EXIT_OK, EXIT_ERROR, EXIT_LOCKED, EXIT_CONFIG, EXIT_CHECK = 0, 1, 2, 3, 4
+
+log = logging.getLogger("vcsp-index")
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def read_conf(path):
+    """Parse a shell-style KEY="value" file (shared with deploy.sh)."""
+    conf = {}
+    if not path or not os.path.isfile(path):
+        return conf
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[7:].strip()
+            val = val.strip()
+            if val[:1] in ("'", '"'):              # KEY="value"   # optional comment
+                end = val.find(val[0], 1)
+                val = val[1:end] if end > 0 else val[1:]
+            else:                                   # KEY=value # optional comment
+                val = val.split(" #", 1)[0].strip()
+            conf[key] = val
+    return conf
+
+
+def conf_bool(value):
+    return str(value).strip().lower() in ("1", "y", "yes", "true", "on")
+
+
+def new_hash(algo):
+    """hashlib constructor that also works when OpenSSL runs in FIPS mode."""
+    try:
+        return hashlib.new(algo, usedforsecurity=False)
+    except TypeError:  # Python < 3.9
+        return hashlib.new(algo)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime(ISO_FORMAT)
+
+
+def nginx_etag(size, mtime_ns):
+    """Same value nginx emits as ETag for a static file: "<mtime-hex>-<size-hex>"."""
+    return "%x-%x" % (mtime_ns // 1_000_000_000, size)
+
+
+_compact = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False).encode  # C-accelerated
+
+
+def dumps(obj):
+    """Pretty JSON for the small per-item and library descriptors."""
+    return (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def dumps_items(entries):
+    """items.json with one compact item per line: C-encoder speed, still greppable."""
+    if not entries:
+        return b'{\n  "items": []\n}\n'
+    body = ",\n    ".join(_compact(e) for e in entries)
+    return ('{\n  "items": [\n    ' + body + "\n  ]\n}\n").encode("utf-8")
+
+
+def sha1_hex(data):
+    h = new_hash("sha1")
+    h.update(data)
+    return h.hexdigest()
+
+
+def _fadvise(fd, advice):
+    try:
+        os.posix_fadvise(fd, 0, 0, advice)
+    except (AttributeError, OSError):
+        pass
+
+
+def hash_file(path, algo, bufsize=8 << 20):
+    """Stream a file through hashlib with read-ahead and cache-eviction hints."""
+    h = new_hash(algo)
+    buf = bytearray(bufsize)
+    view = memoryview(buf)
+    with open(path, "rb", buffering=0) as fh:
+        fd = fh.fileno()
+        _fadvise(fd, getattr(os, "POSIX_FADV_SEQUENTIAL", 2))
+        while True:
+            n = fh.readinto(buf)
+            if not n:
+                break
+            h.update(view[:n])
+        # hashing must not evict the pages nginx is serving to subscribers
+        _fadvise(fd, getattr(os, "POSIX_FADV_DONTNEED", 4))
+    return h.hexdigest()
+
+
+def atomic_write(path, data, mode=0o644, durable=True):
+    """Write bytes via a hidden temp file + rename, so readers never see partial JSON.
+
+    durable=True also fsyncs the file and its directory (lib.json, items.json,
+    state). item.json files skip that: the indexer records their size and
+    rewrites any file a crash left short, so thousands of fsyncs are avoided.
+    """
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(directory, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+        if durable:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if not durable:
+        return
+    try:
+        dfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def href(*parts):
+    return quote("/".join(parts), safe="/")
+
+
+class LockBusy(Exception):
+    pass
+
+
+class IndexLock:
+    """flock()-based lock shared with the upload portal (it swaps item folders under it)."""
+
+    def __init__(self, path, wait_seconds):
+        self.path = path
+        self.wait = max(0, int(wait_seconds or 0))
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o660)
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise LockBusy(self.path)
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+
+
+# --------------------------------------------------------------------------
+# OVF inspection
+# --------------------------------------------------------------------------
+def parse_ovf(path):
+    """Return {"refs": {href: {"size": int|None, "chunked": bool}}, "vapp": bool, "error": str|None}."""
+    try:
+        import xml.etree.ElementTree as ET
+    except ImportError:  # Photon OS ships xml.etree in the python3-xml package
+        raise SystemExit("xml.etree is unavailable: install it with 'tdnf install -y python3-xml'")
+    try:
+        if os.path.getsize(path) > OVF_MAX_BYTES:
+            return {"refs": {}, "vapp": False, "error": "descriptor is larger than 64 MiB"}
+        refs, vapp = {}, False
+        for _event, elem in ET.iterparse(path, events=("start",)):
+            tag = elem.tag.rpartition("}")[2]
+            if tag == "File":
+                attrs = {k.rpartition("}")[2]: v for k, v in elem.attrib.items()}
+                ref = attrs.get("href")
+                if ref:
+                    size = attrs.get("size", "")
+                    refs[ref] = {"size": int(size) if size.isdigit() else None,
+                                 "chunked": "chunkSize" in attrs}
+            elif tag == "VirtualSystemCollection":
+                vapp = True
+        return {"refs": refs, "vapp": vapp, "error": None}
+    except Exception as exc:  # ParseError, OSError, ...
+        return {"refs": {}, "vapp": False, "error": str(exc)}
+
+
+def ovf_problems(info, files):
+    """List references in the descriptor that are missing or have the wrong size."""
+    problems = []
+    for ref, meta in sorted(info["refs"].items()):
+        if "://" in ref:
+            continue  # external reference, fetched by the subscriber itself
+        name = unquote(ref)
+        if "/" in name:
+            problems.append("%s: references into sub-folders are not supported" % ref)
+            continue
+        if meta["chunked"]:
+            if name + ".000000000" not in files:
+                problems.append("missing %s.000000000 (chunked file)" % name)
+            continue
+        st = files.get(name)
+        if st is None:
+            problems.append("missing %s" % name)
+        elif meta["size"] is not None and meta["size"] != st[0]:
+            problems.append("%s is %d bytes, the OVF expects %d" % (name, st[0], meta["size"]))
+    return problems
+
+
+# --------------------------------------------------------------------------
+# indexer
+# --------------------------------------------------------------------------
+class Candidate:
+    __slots__ = ("key", "dir", "child", "name", "type", "files", "meta_sig", "json_size", "warnings")
+
+    def __init__(self, key, directory, child, name, vtype, files, meta_sig, json_size):
+        self.key, self.dir, self.child, self.name = key, directory, child, name
+        self.type, self.files, self.meta_sig, self.json_size = vtype, files, meta_sig, json_size
+        self.warnings = []
+
+    @property
+    def self_href(self):
+        return href(self.dir, self.child, ITEM_FILE) if self.child else href(self.dir, ITEM_FILE)
+
+    def item_json_path(self, lib_root):
+        if self.child:
+            return os.path.join(lib_root, self.dir, self.child, ITEM_FILE)
+        return os.path.join(lib_root, self.dir, ITEM_FILE)
+
+    def signature(self, cfg):
+        h = new_hash("sha1")
+        h.update(repr((cfg, self.type, self.name, sorted(self.files.items()), self.meta_sig)).encode())
+        return h.hexdigest()
+
+
+class Indexer:
+    def __init__(self, conf, args):
+        data_root = conf.get("DATA_ROOT", "/srv/vcsp")
+        self.lib_root = os.path.abspath(args.library or conf.get("LIBRARY_ROOT")
+                                        or os.path.join(data_root, "lib"))
+        self.state_dir = os.path.abspath(args.state_dir or conf.get("STATE_DIR", "/var/lib/vcsp"))
+        self.lib_name = args.name or conf.get("LIB_NAME", "VCSP Content Library")
+        self.etag_mode = (args.etag or conf.get("ETAG_MODE", "stat")).lower()
+        if self.etag_mode not in ETAG_MODES:
+            raise ValueError("ETAG_MODE must be one of %s" % ", ".join(ETAG_MODES))
+        self.skip_cert = conf_bool(conf.get("SKIP_CERT", "yes")) if args.skip_cert is None \
+            else conf_bool(args.skip_cert)
+        self.settle = args.settle if args.settle is not None else int(conf.get("SETTLE_SECONDS", "120"))
+        workers = args.workers if args.workers is not None else int(conf.get("HASH_WORKERS", "0") or 0)
+        self.workers = workers or min(4, os.cpu_count() or 1)
+        self.args = args
+        self.dry = args.dry_run
+        self.cfg = "etag=%s;skipcert=%s;schema=%d" % (self.etag_mode, self.skip_cert, STATE_SCHEMA)
+        self.state_path = os.path.join(self.state_dir, "state.json")
+        self.lock_path = os.path.join(self.state_dir, "index.lock")
+        self.now = time.time()
+        self.hashed_bytes = 0
+        self.report = {"added": [], "updated": [], "removed": [], "deferred": [],
+                       "incomplete": [], "stale": [], "warnings": [], "unchanged": 0}
+
+    # ---------------- state ----------------
+    def load_state(self):
+        try:
+            with open(self.state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            if state.get("schema") == STATE_SCHEMA and state.get("lib_root") == self.lib_root:
+                return state
+            log.warning("state file belongs to another schema/library; re-adopting from items.json")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            log.warning("cannot read %s (%s); re-adopting from items.json", self.state_path, exc)
+        return self.adopt_existing_index()
+
+    def adopt_existing_index(self):
+        """Seed state from an existing lib.json/items.json so IDs and versions survive."""
+        state = {"schema": STATE_SCHEMA, "lib_root": self.lib_root, "etag_mode": None,
+                 "cfg": None, "lib": None, "items": {}, "items_digest": None}
+        try:
+            with open(os.path.join(self.lib_root, LIB_FILE), encoding="utf-8") as fh:
+                lib = json.load(fh)
+            state["lib"] = {"id": lib["id"], "created": lib.get("created") or now_iso(),
+                            "version": int(lib.get("version", 1)), "name": lib.get("name"),
+                            "digest": None}
+            log.info("adopting existing library %s (version %s)", lib["id"], lib.get("version"))
+        except FileNotFoundError:
+            return state
+        except (OSError, ValueError, KeyError) as exc:
+            log.warning("ignoring unreadable %s: %s", LIB_FILE, exc)
+            return state
+        try:
+            with open(os.path.join(self.lib_root, ITEMS_FILE), encoding="utf-8") as fh:
+                items = json.load(fh).get("items", [])
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable %s: %s", ITEMS_FILE, exc)
+            items = []
+        for item in items:
+            try:
+                key = posixpath.dirname(unquote(item["selfHref"]))
+                parts = key.split("/")
+                state["items"][key] = {
+                    "id": item["id"], "created": item.get("created") or now_iso(),
+                    "version": int(item.get("version", NEW_ITEM_VERSION)),
+                    "contentVersion": int(item.get("contentVersion", item.get("version", NEW_ITEM_VERSION))),
+                    "name": item["name"], "type": item.get("type", TYPE_OTHER),
+                    "dir": parts[0], "child": parts[1] if len(parts) > 1 else None,
+                    "description": item.get("description", ""), "sig": None, "adopt": True,
+                    "status": "published", "reason": "", "ovf": None,
+                    "files": {f["name"]: {"size": f.get("size"), "stat": None, "etag": f.get("etag", ""),
+                                          "gen": f.get("generationNum")} for f in item.get("files", [])},
+                    "entry": item, "json_digest": None,
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("skipping malformed entry in %s: %s", ITEMS_FILE, exc)
+        return state
+
+    def save_state(self, state):
+        if not self.dry:
+            os.makedirs(self.state_dir, exist_ok=True)
+            atomic_write(self.state_path, json.dumps(state, separators=(",", ":")).encode(), 0o640)
+
+    # ---------------- scanning ----------------
+    def scan_item_dir(self, directory):
+        """One scandir() per item: returns (files, meta_sig, subdirs, item_json_size)."""
+        files, subdirs, meta_sig, json_size = {}, [], None, -1
+        path = os.path.join(self.lib_root, directory)
+        with os.scandir(path) as it:
+            for entry in it:
+                name = entry.name
+                if name == ITEM_FILE:
+                    json_size = entry.stat(follow_symlinks=False).st_size
+                    continue
+                if name == META_FILE:
+                    st = entry.stat(follow_symlinks=False)
+                    meta_sig = (st.st_size, st.st_mtime_ns, st.st_ino)
+                    continue
+                if name.startswith(".") or name.endswith(IGNORED_SUFFIXES):
+                    continue
+                if entry.is_symlink():
+                    self.warn("%s/%s: symbolic links are not published (nginx refuses them); use a bind mount"
+                              % (directory, name))
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(name)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                files[name] = (st.st_size, st.st_mtime_ns, st.st_ino)
+        return files, meta_sig, subdirs, json_size
+
+    @staticmethod
+    def classify(files):
+        lower = [n.lower() for n in files]
+        if any(n.endswith(".ovf") for n in lower):
+            return TYPE_OVF
+        if lower and all(n.endswith(".iso") for n in lower):
+            return TYPE_ISO
+        return TYPE_OTHER
+
+    def candidates_for_dir(self, directory):
+        files, meta_sig, subdirs, json_size = self.scan_item_dir(directory)
+        if not files:
+            return [], subdirs
+        vtype = self.classify(files)
+        if vtype == TYPE_OVF and self.skip_cert:
+            files = {n: s for n, s in files.items() if not n.lower().endswith(".cert")}
+        if vtype == TYPE_OTHER and any(n.lower().endswith(".ova") for n in files):
+            self.warn("%s: contains an OVA; subscribers treat it as a plain file, not a deployable "
+                      "template. Upload it through the portal (auto-extracts) or extract it with tar." % directory)
+        if vtype == TYPE_ISO and len(files) > 1:
+            # Same behaviour as make_vcsp_2018.py (S3): one media item per ISO,
+            # described by <folder>/<iso-name>/item.json.
+            cands = []
+            for name in sorted(files):
+                child = name[:-4]
+                cands.append(Candidate("%s/%s" % (directory, child), directory, child, child, TYPE_ISO,
+                                       {name: files[name]}, None, None))
+            children = {c.child for c in cands}
+            subdirs = [d for d in subdirs if d not in children]
+            return cands, self.real_subdirs(directory, subdirs)
+        return ([Candidate(directory, directory, None, directory, vtype, files, meta_sig, json_size)],
+                self.real_subdirs(directory, subdirs))
+
+    def real_subdirs(self, directory, subdirs):
+        """Drop leftover per-ISO metadata folders (holding only item.json); they are cleaned up later."""
+        real = []
+        for d in subdirs:
+            try:
+                if set(os.listdir(os.path.join(self.lib_root, directory, d))) <= {ITEM_FILE}:
+                    continue
+            except OSError:
+                pass
+            real.append(d)
+        return real
+
+    # ---------------- evaluation ----------------
+    def warn(self, msg):
+        log.warning(msg)
+        self.report["warnings"].append(msg)
+
+    def read_description(self, cand):
+        if cand.meta_sig is None:
+            return ""
+        try:
+            with open(os.path.join(self.lib_root, cand.dir, META_FILE), encoding="utf-8") as fh:
+                return str(json.load(fh).get("description", ""))[:4000]
+        except (OSError, ValueError, AttributeError) as exc:
+            self.warn("%s: ignoring unreadable %s (%s)" % (cand.dir, META_FILE, exc))
+            return ""
+
+    def json_intact(self, cand, rec):
+        """True when item.json exists with the size last written (detects crash-truncated files)."""
+        size = cand.json_size
+        if size is None:
+            try:
+                size = os.stat(cand.item_json_path(self.lib_root)).st_size
+            except OSError:
+                size = -1
+        return size >= 0 and size == (rec or {}).get("json_size", size)
+
+    def evaluate(self, cand, rec, full):
+        """Return a plan dict, or None when the fast path proves the item unchanged."""
+        sig = cand.signature(self.cfg)
+        if (rec and not full and rec.get("sig") == sig
+                and rec.get("status") in ("published", "incomplete", "stale")
+                and (rec.get("status") != "published" or self.json_intact(cand, rec))):
+            self.report["unchanged"] += 1
+            return None
+
+        plan = {"cand": cand, "rec": rec, "sig": sig, "status": "published", "reason": "",
+                "description": self.read_description(cand), "ovf": rec.get("ovf") if rec else None,
+                "vapp": False, "etags": {}, "hash": []}
+
+        newest = max(s[1] for s in cand.files.values()) / 1e9
+        if self.settle and self.now - newest < self.settle:
+            plan["status"] = "deferred"
+            plan["reason"] = "files changed %ds ago; waiting %ds for copies to finish" % (
+                max(0, self.now - newest), self.settle)
+            return plan
+
+        if cand.type == TYPE_OVF:
+            ovfs = sorted(n for n in cand.files if n.lower().endswith(".ovf"))
+            if len(ovfs) > 1:
+                plan["status"], plan["reason"] = "incomplete", "more than one OVF descriptor: " + ", ".join(ovfs)
+            else:
+                stat = list(cand.files[ovfs[0]])
+                info = plan["ovf"]
+                if not info or info.get("stat") != stat:
+                    info = parse_ovf(os.path.join(self.lib_root, cand.dir, ovfs[0]))
+                    info["stat"] = stat
+                    plan["ovf"] = info
+                if info["error"]:
+                    plan["status"], plan["reason"] = "incomplete", "%s: %s" % (ovfs[0], info["error"])
+                else:
+                    problems = ovf_problems(info, cand.files)
+                    if problems:
+                        plan["status"], plan["reason"] = "incomplete", "; ".join(problems)
+                plan["vapp"] = bool(info.get("vapp"))
+        if plan["status"] != "published":
+            return plan
+
+        old_files = rec.get("files", {}) if rec else {}
+        for name, st in cand.files.items():
+            prev = old_files.get(name)
+            if prev and prev.get("stat") == list(st) and prev.get("mode") == self.etag_mode:
+                plan["etags"][name] = (prev["etag"], prev["gen"])
+            elif prev and prev.get("stat") is None and rec.get("adopt") and prev.get("size") == st[0]:
+                # adopting an index built by make_vcsp_2018.py: keep its etag until the file changes
+                plan["etags"][name] = (prev["etag"], prev.get("gen") or st[1] // 1_000_000_000)
+            elif self.etag_mode == "stat":
+                plan["etags"][name] = (nginx_etag(st[0], st[1]), st[1] // 1_000_000_000)
+            else:
+                plan["hash"].append(name)
+        return plan
+
+    def run_hashes(self, plans):
+        jobs = [(p, n) for p in plans if p["status"] == "published" for n in p["hash"]]
+        if not jobs:
+            return
+        total = sum(p["cand"].files[n][0] for p, n in jobs)
+        log.info("hashing %d file(s), %.1f GiB with %s (%d workers)",
+                 len(jobs), total / (1 << 30), self.etag_mode, self.workers)
+
+        def work(job):
+            plan, name = job
+            return hash_file(os.path.join(self.lib_root, plan["cand"].dir, name), self.etag_mode)
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for (plan, name), value in zip(jobs, pool.map(work, jobs)):
+                st = plan["cand"].files[name]
+                plan["etags"][name] = (value, st[1] // 1_000_000_000)
+        self.hashed_bytes += total
+
+    def make_item(self, cand, item_id, created, version, cversion, description, files_json, lib_id, vapp):
+        item = {
+            "created": created,
+            "description": description,
+            "version": str(version),
+            "contentVersion": str(cversion),
+            "files": files_json,
+            "id": item_id,
+            "name": cand.name,
+        }
+        if cand.type == TYPE_OVF:
+            # same "type-metadata" make_vcsp_2018.py emits so vCenter shows the OVF/vApp type
+            value = json.dumps({"id": item_id, "version": str(version), "libraryIdParent": lib_id,
+                                "isVappTemplate": "true" if vapp else "false", "vmTemplate": None,
+                                "vappTemplate": None, "networks": [], "storagePolicyGroups": None},
+                               separators=(",", ":"))
+            item["metadata"] = [{"key": "type-metadata", "value": value, "type": "String",
+                                 "domain": "SYSTEM", "visibility": "READONLY"}]
+        item["properties"] = {}
+        item["selfHref"] = cand.self_href
+        item["type"] = cand.type
+        return item
+
+    def finalize(self, plan, lib_id):
+        """Turn a plan into a state record; returns (record, index_changed, version_changed)."""
+        cand, rec = plan["cand"], plan["rec"]
+        published = rec.get("entry") if rec else None
+        base = {"name": cand.name, "type": cand.type, "dir": cand.dir, "child": cand.child}
+
+        if plan["status"] != "published":
+            if published:
+                # keep serving the last good version instead of withdrawing it from tenants
+                rec = dict(rec, **base)
+                rec["status"] = "stale" if plan["status"] == "incomplete" else "deferred"
+                rec["reason"] = plan["reason"] + " (still publishing version %s)" % rec["version"]
+                rec["sig"] = plan["sig"] if plan["status"] == "incomplete" else None
+                rec["ovf"] = plan["ovf"]
+                self.report["stale" if plan["status"] == "incomplete" else "deferred"].append(cand.key)
+                return rec, False, False
+            new = dict(base, id=(rec or {}).get("id"), status=plan["status"], reason=plan["reason"],
+                       sig=plan["sig"] if plan["status"] == "incomplete" else None, entry=None,
+                       files={}, ovf=plan["ovf"], json_digest=None)
+            self.report[plan["status"]].append(cand.key)
+            return new, bool(rec and rec.get("entry")), False
+
+        files_state, files_json = {}, []
+        for name in sorted(cand.files):
+            st = cand.files[name]
+            etag, gen = plan["etags"][name]
+            files_state[name] = {"size": st[0], "stat": list(st), "etag": etag, "gen": gen,
+                                 "mode": self.etag_mode}
+            files_json.append({"name": name, "size": st[0], "etag": etag, "generationNum": gen,
+                               "hrefs": [href(cand.dir, name)]})
+
+        if published:
+            old = {f["name"]: (f.get("size"), f.get("etag")) for f in published.get("files", [])}
+            new = {f["name"]: (f["size"], f["etag"]) for f in files_json}
+            files_changed = old != new
+            meta_changed = (published.get("description", "") != plan["description"]
+                            or published.get("name") != cand.name or published.get("type") != cand.type)
+            item_id, created = rec["id"], rec["created"]
+            version = int(rec["version"]) + (1 if files_changed or meta_changed else 0)
+            cversion = int(rec.get("contentVersion", rec["version"])) + (1 if files_changed else 0)
+        else:
+            files_changed = True
+            item_id = (rec or {}).get("id") or "urn:uuid:%s" % uuid.uuid4()
+            created = now_iso()
+            version = cversion = NEW_ITEM_VERSION
+
+        entry = self.make_item(cand, item_id, created, version, cversion, plan["description"],
+                               files_json, lib_id, plan["vapp"])
+        data = dumps(entry)
+        json_digest = sha1_hex(data)
+        target = cand.item_json_path(self.lib_root)
+        if (self.args.rebuild or json_digest != (rec or {}).get("json_digest")
+                or not self.json_intact(cand, dict(rec or {}, json_size=len(data)))):
+            if not self.dry:
+                if cand.child:
+                    os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+                atomic_write(target, data, durable=False)
+
+        version_changed = not published or version != int(rec["version"])
+        if not published:
+            self.report["added"].append(cand.key)
+        elif version_changed:
+            self.report["updated"].append(cand.key)
+        record = dict(base, id=item_id, created=created, version=version, contentVersion=cversion,
+                      description=plan["description"], sig=plan["sig"], status="published", reason="",
+                      files=files_state, ovf=plan["ovf"], entry=entry, json_digest=json_digest,
+                      json_size=len(data))
+        return record, entry != published, version_changed
+
+    def remove_record(self, key, rec):
+        """Forget an item; delete the item.json this tool generated for it."""
+        self.report["removed"].append(key)
+        if self.dry:
+            return
+        path = os.path.join(self.lib_root, key, ITEM_FILE)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        if rec.get("child"):
+            try:
+                os.rmdir(os.path.join(self.lib_root, key))  # only succeeds when empty
+            except OSError:
+                pass
+
+    # ---------------- main ----------------
+    def run(self):
+        if not os.path.isdir(self.lib_root):
+            raise FileNotFoundError("library root %s does not exist" % self.lib_root)
+        os.makedirs(self.state_dir, exist_ok=True)
+        with IndexLock(self.lock_path, self.args.wait):
+            return self._run_locked()
+
+    def _run_locked(self):
+        t0 = time.monotonic()
+        state = self.load_state()
+        if state.get("etag_mode") and state["etag_mode"] != self.etag_mode and not self.args.force:
+            raise ValueError("ETAG_MODE changed from %s to %s. Every item version would increase and all "
+                             "subscribers would download everything again. Re-run with --force to accept."
+                             % (state["etag_mode"], self.etag_mode))
+        full = self.args.rebuild or state.get("cfg") != self.cfg
+        items = state["items"]
+        dirty = full
+
+        lib = state.get("lib")
+        lib_bump = False
+        if not lib:
+            lib = {"id": "urn:uuid:%s" % uuid.uuid4(), "created": now_iso(), "version": 0,
+                   "name": self.lib_name, "digest": None}
+            lib_bump = True
+        elif lib.get("name") != self.lib_name:
+            lib["name"] = self.lib_name
+            lib_bump = True
+
+        # which item folders to look at
+        if self.args.only:
+            name = self.args.only.strip("/")
+            if not name or "/" in name or name.startswith("."):
+                raise ValueError("--only expects a top-level item folder name")
+            dirs = [name] if os.path.isdir(os.path.join(self.lib_root, name)) else []
+            scope = {name}
+        else:
+            dirs = []
+            with os.scandir(self.lib_root) as it:
+                for entry in it:
+                    if (entry.is_dir(follow_symlinks=False) and not entry.name.startswith(".")
+                            and entry.name not in IGNORED_ROOT_DIRS):
+                        dirs.append(entry.name)
+            scope = None
+
+        plans, seen = [], set()
+        for directory in sorted(dirs):
+            if not set(directory) <= SAFE_NAME_CHARS:
+                self.warn("%s: folder names outside [A-Za-z0-9._-] are percent-encoded in URLs; "
+                          "rename it for best compatibility" % directory)
+            cands, stray = self.candidates_for_dir(directory)
+            for d in stray:
+                self.warn("%s/%s: sub-folders inside an item are ignored" % (directory, d))
+            for cand in cands:
+                seen.add(cand.key)
+                plan = self.evaluate(cand, items.get(cand.key), full)
+                if plan is not None:
+                    plans.append(plan)
+
+        self.run_hashes(plans)
+        index_changed = lib_bump or self.args.rebuild
+
+        for plan in plans:
+            rec, changed, bumped = self.finalize(plan, lib["id"])
+            items[plan["cand"].key] = rec
+            dirty = True
+            index_changed |= changed
+            lib_bump |= bumped
+
+        for key in [k for k, r in items.items() if k not in seen and (scope is None or r.get("dir") in scope)]:
+            rec = items.pop(key)
+            dirty = True
+            if rec.get("entry"):
+                index_changed = lib_bump = True
+            self.remove_record(key, rec)
+
+        items_path = os.path.join(self.lib_root, ITEMS_FILE)
+        lib_path = os.path.join(self.lib_root, LIB_FILE)
+        if not os.path.isfile(items_path) or not os.path.isfile(lib_path):
+            index_changed = True
+
+        if index_changed:
+            published = sorted((r["entry"] for r in items.values() if r.get("entry")),
+                               key=lambda e: (e["name"].lower(), e["selfHref"]))
+            data = dumps_items(published)
+            items_digest = sha1_hex(data)
+            if items_digest != state.get("items_digest") or not os.path.isfile(items_path) or self.args.rebuild:
+                if not self.dry:
+                    atomic_write(items_path, data)
+                state["items_digest"] = items_digest
+            if lib_bump:
+                lib["version"] = int(lib["version"]) + 1
+            lib_doc = {
+                "vcspVersion": VCSP_VERSION,
+                "version": str(lib["version"]),
+                "contentVersion": "1",
+                "name": lib["name"],
+                "id": lib["id"],
+                "created": lib["created"],
+                "capabilities": {"transferIn": ["httpGet"], "transferOut": ["httpGet"]},
+                "itemsHref": ITEMS_FILE,
+            }
+            data = dumps(lib_doc)
+            lib_digest = sha1_hex(data)
+            if lib_digest != lib.get("digest") or not os.path.isfile(lib_path) or self.args.rebuild:
+                if not self.dry:
+                    atomic_write(lib_path, data)  # written last: the subscriber's commit point
+                lib["digest"] = lib_digest
+            dirty = True
+
+        state["lib"], state["etag_mode"], state["cfg"] = lib, self.etag_mode, self.cfg
+        if dirty:
+            self.save_state(state)
+
+        statuses = [r.get("status") for r in items.values()]
+        return {
+            "library": self.lib_root,
+            "lib_id": lib["id"],
+            "lib_version": lib["version"],
+            "lib_changed": bool(lib_bump),
+            "items": {s: statuses.count(s) for s in ("published", "deferred", "incomplete", "stale")},
+            "added": self.report["added"], "updated": self.report["updated"],
+            "removed": self.report["removed"], "deferred": self.report["deferred"],
+            "incomplete": self.report["incomplete"], "stale": self.report["stale"],
+            "unchanged": self.report["unchanged"], "warnings": self.report["warnings"],
+            "item_status": {k: {"status": r.get("status"), "version": r.get("version"),
+                                "reason": r.get("reason", "")}
+                            for k, r in items.items() if scope is None or r.get("dir") in scope},
+            "hashed_bytes": self.hashed_bytes,
+            "elapsed_seconds": round(time.monotonic() - t0, 4),
+            "dry_run": self.dry,
+        }
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def print_status(indexer):
+    try:
+        with open(indexer.state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        print("no index state yet (%s)" % indexer.state_path)
+        return EXIT_OK
+    lib = state.get("lib") or {}
+    print("library %s  version %s  (%s)" % (lib.get("name"), lib.get("version"), lib.get("id")))
+    rows = sorted(state.get("items", {}).items())
+    width = max([len(k) for k, _ in rows] + [4])
+    for key, rec in rows:
+        print("%-*s  %-10s  v%-4s %-10s %s" % (width, key, rec.get("type", ""), rec.get("version", "-"),
+                                              rec.get("status", ""), rec.get("reason", "")))
+    return EXIT_OK
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="vcsp-index",
+        description="Generate or update the VCSP index (lib.json, items.json, item.json) "
+                    "of a third-party content library for VMware Cloud Director and vCenter.")
+    p.add_argument("--config", default=DEFAULT_CONF, help="settings file (default %(default)s)")
+    p.add_argument("--library", help="library root folder (default DATA_ROOT/lib from the config)")
+    p.add_argument("--state-dir", help="where state.json and the lock live (default STATE_DIR)")
+    p.add_argument("--name", help="library display name (default LIB_NAME)")
+    p.add_argument("--etag", choices=ETAG_MODES, help="file etag source (default ETAG_MODE, 'stat')")
+    p.add_argument("--skip-cert", choices=("yes", "no"), default=None,
+                   help="leave .cert files out of OVF items, like make_vcsp_2018.py (default SKIP_CERT)")
+    p.add_argument("--settle", type=int, help="seconds a file must be unchanged before it is published")
+    p.add_argument("--workers", type=int, help="parallel hashing threads for md5/sha256 etags")
+    p.add_argument("--only", metavar="ITEM", help="re-index a single top-level item folder")
+    p.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                   help="wait this long for a concurrent run to finish (default: fail at once)")
+    p.add_argument("--rebuild", action="store_true",
+                   help="re-evaluate every item and rewrite all JSON files (IDs and versions are kept)")
+    p.add_argument("--force", action="store_true", help="accept an ETAG_MODE change")
+    p.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p.add_argument("--check", action="store_true",
+                   help="exit 4 when any item is incomplete, stale or waiting (for monitoring)")
+    p.add_argument("--status", action="store_true", help="print the indexed items and exit")
+    p.add_argument("--json", action="store_true", help="print the run summary as JSON")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s", stream=sys.stderr)
+    conf = read_conf(args.config)
+    try:
+        indexer = Indexer(conf, args)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return EXIT_CONFIG
+    if args.status:
+        return print_status(indexer)
+    try:
+        summary = indexer.run()
+    except LockBusy:
+        log.error("another vcsp-index run holds %s; use --wait SECONDS to queue", indexer.lock_path)
+        return EXIT_LOCKED
+    except (ValueError, FileNotFoundError) as exc:
+        log.error("%s", exc)
+        return EXIT_CONFIG
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        c = summary["items"]
+        print("lib v%s%s | %d published, %d waiting, %d incomplete, %d stale | +%d ~%d -%d | %d unchanged | %.3fs%s"
+              % (summary["lib_version"], " (new)" if summary["lib_changed"] else "",
+                 c["published"], c["deferred"], c["incomplete"], c["stale"],
+                 len(summary["added"]), len(summary["updated"]), len(summary["removed"]),
+                 summary["unchanged"], summary["elapsed_seconds"],
+                 " [dry run]" if summary["dry_run"] else ""))
+        for key, info in sorted(summary["item_status"].items()):
+            if info["status"] != "published":
+                print("  %-9s %s: %s" % (info["status"], key, info["reason"]))
+    if args.check and (summary["incomplete"] or summary["stale"] or summary["deferred"]):
+        return EXIT_CHECK
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/grep
+    sys.exit(main())

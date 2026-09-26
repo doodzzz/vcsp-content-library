@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic VCSP content library index update
+
+[Timer]
+OnBootSec=90s
+# deploy.sh overrides the period from INDEX_INTERVAL in vcsp-index.timer.d/10-interval.conf
+OnUnitActiveSec=5min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
