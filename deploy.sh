@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="1.0.0"
+readonly VCSP_VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -89,6 +89,11 @@ load_config() {
   for cidr in ${LIB_ALLOW_CIDRS//,/ } ${ADMIN_ALLOW_CIDRS//,/ }; do
     [[ $cidr =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || die "'$cidr' is not an IP address or CIDR"
   done
+  # Resolve symbolic links once. Photon OS ships /srv as a link to var/srv (filesystem
+  # package), so the default DATA_ROOT=/srv/vcsp really lives in /var/srv/vcsp. nginx
+  # (disable_symlinks) and the systemd sandbox are always given the real directories.
+  DATA_ROOT_REAL=$(realpath -m -- "$DATA_ROOT")
+  STATE_DIR_REAL=$(realpath -m -- "$STATE_DIR")
 }
 
 set_conf_value() {  # set_conf_value KEY VALUE (in the installed config)
@@ -198,26 +203,35 @@ create_user_and_dirs() {
     useradd -r -g "$VCSP_USER" -d "$STATE_DIR" -s "$(command -v nologin || echo /bin/false)" \
       -c "VCSP content library" "$VCSP_USER"
   fi
-  install -d -m 0755 "$DATA_ROOT"
-  install -d -m 0755 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT/lib"
-  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT/staging"
-  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$STATE_DIR"
+  if [[ $DATA_ROOT_REAL != "$DATA_ROOT" ]]; then
+    info "DATA_ROOT $DATA_ROOT resolves to $DATA_ROOT_REAL (on Photon OS /srv is a link to /var/srv); nginx and systemd use the resolved path"
+  fi
+  local sub
+  for sub in lib staging; do
+    if [[ -L $DATA_ROOT_REAL/$sub ]]; then
+      die "$DATA_ROOT/$sub is a symbolic link to $(readlink -f -- "$DATA_ROOT_REAL/$sub"). nginx does not follow links inside the library. Set DATA_ROOT to the real folder that holds lib/ and staging/, or replace the link with a bind mount (README, Troubleshooting)."
+    fi
+  done
+  install -d -m 0755 "$DATA_ROOT_REAL"
+  install -d -m 0755 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/lib"
+  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$DATA_ROOT_REAL/staging"
+  install -d -m 0750 -o "$VCSP_USER" -g "$VCSP_USER" "$STATE_DIR_REAL"
   # 0751: nginx workers must traverse into /etc/vcsp to read the htpasswd files;
   # the files themselves stay group-restricted (vcsp.conf -> vcsp, htpasswd/tls -> nginx)
   install -d -m 0751 -o root -g "$VCSP_USER" "$VCSP_ETC"
-  if [[ -n $(find "$DATA_ROOT/lib" -mindepth 1 ! -user "$VCSP_USER" -print -quit) ]]; then
-    info "Taking ownership of existing library content in $DATA_ROOT/lib"
-    chown -R "$VCSP_USER:$VCSP_USER" "$DATA_ROOT/lib"
+  if [[ -n $(find "$DATA_ROOT_REAL/lib" -mindepth 1 ! -user "$VCSP_USER" -print -quit) ]]; then
+    info "Taking ownership of existing library content in $DATA_ROOT_REAL/lib"
+    chown -R "$VCSP_USER:$VCSP_USER" "$DATA_ROOT_REAL/lib"
   fi
   # nginx must be able to traverse every parent of the library
-  local p=$DATA_ROOT
+  local p=$DATA_ROOT_REAL
   while [[ $p != / ]]; do
     [[ $(stat -c %A "$p") == *x ]] || { warn "$p is not world-searchable; nginx cannot reach the library"; }
     p=$(dirname "$p")
   done
-  [[ $(stat -c %d "$DATA_ROOT/lib") == "$(stat -c %d "$DATA_ROOT/staging")" ]] \
+  [[ $(stat -c %d "$DATA_ROOT_REAL/lib") == "$(stat -c %d "$DATA_ROOT_REAL/staging")" ]] \
     || warn "$DATA_ROOT/lib and $DATA_ROOT/staging are on different filesystems; publishing will copy data"
-  info "Library storage: $(df -h --output=avail "$DATA_ROOT" | tail -1 | tr -d ' ') free on $(df --output=target "$DATA_ROOT" | tail -1)"
+  info "Library storage: $(df -h --output=avail "$DATA_ROOT_REAL" | tail -1 | tr -d ' ') free on $(df --output=target "$DATA_ROOT_REAL" | tail -1)"
 }
 
 install_payload() {
@@ -506,12 +520,14 @@ $listen6
 
         # VCSP endpoint - subscription URL: https://$SERVER_FQDN/lib/lib.json
         location /lib/ {
-            root $DATA_ROOT;
+            root $DATA_ROOT_REAL;             # DATA_ROOT=$DATA_ROOT, links resolved
 $lib_acl$lib_auth            limit_except GET {
                 deny all;
             }
             autoindex off;
-            disable_symlinks on;
+            # links above the document root are allowed (Photon OS: /srv -> var/srv);
+            # links inside the library are refused so nothing outside it can be exposed
+            disable_symlinks on from=\$document_root;
             types {
                 application/json          json;
                 application/xml           ovf;
@@ -609,7 +625,7 @@ configure_systemd() {
   local unit
   for unit in vcsp-upload vcsp-index; do
     install -d -m 0755 "/etc/systemd/system/$unit.service.d"
-    printf '[Service]\nReadWritePaths=%s %s\n' "$DATA_ROOT" "$STATE_DIR" > "/etc/systemd/system/$unit.service.d/10-paths.conf"
+    printf '[Service]\nReadWritePaths=%s %s\n' "$DATA_ROOT_REAL" "$STATE_DIR_REAL" > "/etc/systemd/system/$unit.service.d/10-paths.conf"
   done
   install -d -m 0755 /etc/systemd/system/vcsp-index.timer.d
   printf '[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%s\n' "$INDEX_INTERVAL" > /etc/systemd/system/vcsp-index.timer.d/10-interval.conf
@@ -677,30 +693,71 @@ http_code() {  # http_code URL [user:password]
   fi
 }
 
+remove_htpasswd_users() {  # remove_htpasswd_users FILE REGEX
+  local file=$1 regex=$2 tmp
+  [[ -f $file ]] && grep -qE "$regex" "$file" || return 0
+  tmp=$(mktemp)
+  grep -vE "$regex" "$file" > "$tmp" || true
+  install -m 0640 -o root -g nginx "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+probe_code() {  # probe_code HTPASSWD_FILE URL: HTTP status for a signed-in request
+  # Uses a throw-away account so verify never needs the real passwords; nginx
+  # reads the password file per request, so no reload is involved.
+  local file=$1 url=$2 user pw code
+  user="vcsp-verify-$$"
+  pw=$(openssl rand -hex 16)
+  set_htpasswd "$file" "$user" "$pw"
+  code=$(http_code "$url" "$user:$pw")
+  remove_htpasswd_users "$file" "^${user}:"
+  printf '%s' "$code"
+}
+
+library_path_ok() {  # nginx refuses links below the document root
+  local p
+  for p in "$DATA_ROOT_REAL/lib" "$DATA_ROOT_REAL/lib/lib.json"; do
+    [[ -e $p && ! -L $p ]] || return 1
+  done
+  runuser -u nginx -- test -r "$DATA_ROOT_REAL/lib/lib.json"
+}
+
 verify() {
   local base="https://$SERVER_FQDN" expected
   CHECK_FAILS=0
   info "Verifying the deployment"
+  remove_htpasswd_users "$VCSP_ETC/htpasswd-library" '^vcsp-verify-'   # leftovers of an interrupted run
+  remove_htpasswd_users "$VCSP_ETC/htpasswd-admin" '^vcsp-verify-'
   check "nginx configuration is valid" nginx -t -q
   check "nginx is running" systemctl is-active --quiet nginx
   check "upload service is running" systemctl is-active --quiet vcsp-upload
   check "index timer is active" systemctl is-active --quiet vcsp-index.timer
   check "upload backend answers on $UPLOAD_LISTEN:$UPLOAD_PORT" curl -fsS "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/health"
-  check "lib.json on disk is valid JSON" python3 -m json.tool "$DATA_ROOT/lib/lib.json"
+  check "lib.json on disk is valid JSON" python3 -m json.tool "$DATA_ROOT_REAL/lib/lib.json"
+  check "library path is readable by nginx without links ($DATA_ROOT_REAL/lib)" library_path_ok
   check "TLS certificate covers $SERVER_FQDN" sh -c "openssl x509 -noout -ext subjectAltName -in '$TLS_DIR/server.crt' | grep -q 'DNS:$SERVER_FQDN'"
   expected=200
   [[ $LIB_AUTH == basic ]] && expected=401
   check "lib.json without credentials returns $expected" test "$(http_code "$base/lib/lib.json")" = "$expected"
-  if [[ -n $LIB_PW_VERIFY ]]; then
+  if [[ $LIB_AUTH == none ]]; then
+    :   # the anonymous request above already fetched the file
+  elif [[ -n $LIB_PW_VERIFY ]]; then
     check "lib.json as user vcsp returns 200" test "$(http_code "$base/lib/lib.json" "vcsp:$LIB_PW_VERIFY")" = 200
+  else
+    check "lib.json with valid credentials returns 200" \
+      test "$(probe_code "$VCSP_ETC/htpasswd-library" "$base/lib/lib.json")" = 200
   fi
   check "hidden files are not served" test "$(http_code "$base/lib/.vcsp-probe")" = 404
   check "portal requires sign-in" test "$(http_code "$base/upload/")" = 401
   if [[ -n $ADMIN_PW_VERIFY ]]; then
     check "portal API answers for the administrator" test "$(http_code "$base/upload/api/config" "$ADMIN_PW_VERIFY")" = 200
+  else
+    check "portal API answers for a signed-in user" \
+      test "$(probe_code "$VCSP_ETC/htpasswd-admin" "$base/upload/api/config")" = 200
   fi
   if (( CHECK_FAILS )); then
-    warn "$CHECK_FAILS check(s) failed; see journalctl -u vcsp-upload -u nginx"
+    warn "$CHECK_FAILS check(s) failed; see /var/log/nginx/error.log and journalctl -u vcsp-upload"
+    warn "'(20: Not a directory)' in the nginx log means a folder in the library path is a symbolic link"
     return 1
   fi
   info "All checks passed"
@@ -711,7 +768,12 @@ status() {
   echo
   runuser -u "$VCSP_USER" -- python3 "$VCSP_HOME/bin/vcsp-index" --config "$CONF_FILE" --status || true
   echo
-  df -h "$DATA_ROOT" | tail -1 | awk '{printf "Library storage: %s used of %s (%s free)\n", $3, $2, $4}'
+  df -h "$DATA_ROOT_REAL" | tail -1 | awk '{printf "Library storage: %s used of %s (%s free)\n", $3, $2, $4}'
+  if [[ $DATA_ROOT_REAL != "$DATA_ROOT" ]]; then
+    echo "Library folder: $DATA_ROOT_REAL/lib (DATA_ROOT $DATA_ROOT resolves here)"
+  else
+    echo "Library folder: $DATA_ROOT_REAL/lib"
+  fi
   echo "Subscription URL: ${PUBLIC_BASE_URL:-https://$SERVER_FQDN}/lib/lib.json"
   echo "Certificate SHA-256: $(fingerprint 2>/dev/null || echo unavailable)"
 }
@@ -778,7 +840,7 @@ uninstall() {
       read -rp "Type 'purge' to delete $DATA_ROOT, $STATE_DIR and $VCSP_ETC permanently: " answer
       [[ $answer == purge ]] || die "purge cancelled; data kept"
     fi
-    rm -rf "$DATA_ROOT" "$STATE_DIR" "$VCSP_ETC"
+    rm -rf "$DATA_ROOT_REAL" "$STATE_DIR_REAL" "$VCSP_ETC"
     info "Library data, index state and configuration deleted"
   else
     info "Kept: library $DATA_ROOT, index state $STATE_DIR, configuration $VCSP_ETC"
