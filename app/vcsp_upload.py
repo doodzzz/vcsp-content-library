@@ -24,6 +24,12 @@ Upload protocol (resumable, no multipart parsing, constant memory):
   GET    /api/jobs/<id>                job progress
   DELETE /api/items/<item>             remove an item (job)
   GET    /api/config | /api/items | /api/uploads | /api/health
+
+S3 import (only when the provider lists endpoints in S3_ALLOWED_ENDPOINTS):
+  POST   /api/s3/list                  {endpoint, region, bucket, prefix, keys...} -> OVA/ISO objects
+  POST   /api/s3/import                {..., key, item, description?, mode} -> job (download + publish)
+  DELETE /api/jobs/<id>                cancel a running import
+Tenant credentials for S3 are used for that one call or job and never stored.
 """
 
 import argparse
@@ -45,8 +51,9 @@ from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vcsp_validate as V  # noqa: E402
+import vcsp_s3 as S3  # noqa: E402
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 META_FILE = ".vcsp-meta.json"
 COPY_BUF = 1 << 20
 PROVIDER = "_provider"
@@ -109,6 +116,14 @@ class Settings:
         fqdn = g("SERVER_FQDN", "localhost")
         self.public_url = (g("PUBLIC_BASE_URL") or "https://" + fqdn).rstrip("/")
         self.index_bin = g("INDEX_BIN", "/opt/vcsp/bin/vcsp-index")
+        self.s3_endpoints = []
+        for ep in re.split(r"[\s,]+", g("S3_ALLOWED_ENDPOINTS", "")):
+            ep = ep.strip().rstrip("/")
+            if ep and S3.ENDPOINT_RE.match(ep) and ep not in self.s3_endpoints:
+                self.s3_endpoints.append(ep)
+        self.s3_region = g("S3_DEFAULT_REGION", "us-east-1")
+        self.s3_addressing = g("S3_ADDRESSING", "path")
+        self.s3_ca_file = g("S3_CA_FILE", "") or None
 
     def load_proxy_key(self):
         try:
@@ -236,6 +251,7 @@ class Job:
         self.state, self.steps, self.notes = "running", [], []
         self.error, self.result = None, None
         self.started, self.finished = time.time(), None
+        self.progress, self.cancel_requested = None, False
 
     def _who(self):
         return "job=%s tenant=%s item=%s user=%s" % (self.id[:8], self.tenant, self.item, self.user)
@@ -255,7 +271,9 @@ class Job:
 
     def public(self):
         return {"id": self.id, "kind": self.kind, "item": self.item, "state": self.state,
-                "steps": self.steps, "notes": self.notes, "error": self.error, "result": self.result}
+                "steps": self.steps, "notes": self.notes, "error": self.error, "result": self.result,
+                "progress": self.progress,
+                "cancellable": self.kind == "s3-import" and self.state == "running" and self.progress is not None}
 
 
 # ------------------------------------------------------------------ portal
@@ -368,6 +386,8 @@ class Portal:
             "ova_extract": self.s.ova_extract,
             "allow_delete": self.s.allow_delete,
             "name_pattern": V.NAME_RE.pattern,
+            "s3": {"enabled": bool(self.s3_import_allowed()), "endpoints": self.s.s3_endpoints,
+                   "region": self.s.s3_region, "addressing": self.s.s3_addressing},
             "user": user,
             "version": __version__,
         }
@@ -740,6 +760,143 @@ class Portal:
             raise ApiError(404, "Unknown job.")
         return job.public()
 
+    # -------- S3 import
+    S3_EXTENSIONS = ("ova", "iso")
+
+    def s3_import_allowed(self):
+        return [e for e in self.S3_EXTENSIONS if e in self.s.allowed] if self.s.s3_endpoints else []
+
+    def _s3_client(self, body):
+        if not self.s3_import_allowed():
+            raise ApiError(403, "Importing from S3 is not enabled on this server.")
+        endpoint = str(body.get("endpoint", "")).strip().rstrip("/")
+        if endpoint not in self.s.s3_endpoints:
+            raise ApiError(400, "That S3 endpoint is not on the provider's list of allowed endpoints.")
+        region = str(body.get("region") or self.s.s3_region).strip()
+        addressing = str(body.get("addressing") or self.s.s3_addressing).strip()
+        try:
+            return S3.S3Client(endpoint, region, str(body.get("bucket", "")).strip(),
+                               str(body.get("access_key", "")).strip(), str(body.get("secret_key", "")),
+                               str(body.get("session_token", "")).strip() or None, addressing, self.s.s3_ca_file)
+        except S3.S3Error as exc:
+            raise ApiError(400, str(exc))
+
+    @staticmethod
+    def _s3_filename(key):
+        """Object key -> a file name the library accepts (unsafe characters become hyphens)."""
+        name = key.rsplit("/", 1)[-1]
+        stem, _, ext = name.rpartition(".")
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")[:190] or "image"
+        if not stem[0].isalnum():
+            stem = "i" + stem
+        return "%s.%s" % (stem, ext.lower())
+
+    def s3_list(self, sc, body, user):
+        client = self._s3_client(body)
+        prefix = str(body.get("prefix", ""))[:1024]
+        token = str(body.get("continuation") or "")[:4096] or None
+        try:
+            page = client.list(prefix, token)
+        except S3.S3Error as exc:
+            raise ApiError(502, str(exc))
+        wanted = self.s3_import_allowed()
+        objects = [o for o in page["objects"] if V.ext_of(o["key"]) in wanted and o["size"] > 0]
+        log.info("s3-list tenant=%s user=%s endpoint=%s bucket=%s prefix=%r scanned=%d matched=%d",
+                 sc.label, user, client.endpoint, client.bucket, prefix, len(page["objects"]), len(objects))
+        return {"objects": objects, "next": page["next"], "scanned": len(page["objects"])}
+
+    def s3_import(self, sc, body, user):
+        client = self._s3_client(body)
+        key = str(body.get("key", ""))
+        if not key or len(key.encode()) > 1024 or any(ord(ch) < 32 for ch in key):
+            raise ApiError(400, "Choose an object to import.")
+        ext = V.ext_of(key)
+        if ext not in self.s3_import_allowed():
+            raise ApiError(400, "Only %s objects can be imported from S3." % " and ".join("." + e for e in self.s3_import_allowed()))
+        item = self.check_item(str(body.get("item", "")).strip())
+        filename = self._s3_filename(key)
+        try:
+            V.check_file_name(filename, self.s.allowed)
+        except V.ValidationError as exc:
+            raise ApiError(400, str(exc))
+        mode = body.get("mode", "replace")
+        if mode not in ("replace", "merge"):
+            raise ApiError(400, "mode must be replace or merge.")
+        description = None
+        if "description" in body and body["description"] is not None:
+            description = str(body["description"]).strip()[:2000]
+        if self.list_files(os.path.join(sc.ready, item)):
+            raise ApiError(409, "Files are already staged for %s; publish or discard them before importing." % item)
+        try:
+            head = client.head(key)
+        except S3.S3Error as exc:
+            raise ApiError(502, str(exc))
+        size = head["size"]
+        if size <= 0:
+            raise ApiError(400, "The object is empty.")
+        if size > self.s.max_file:
+            raise ApiError(413, "The object is %s; the limit is %s (MAX_FILE_SIZE_GB)." % (human(size), human(self.s.max_file)))
+        need = size * (2 if ext == "ova" and self.s.ova_extract else 1)
+        if sc.quota:
+            used = tree_size(sc.lib_root, sc.staging)
+            if used + need > sc.quota:
+                raise ApiError(507, "Importing it would exceed this tenant's storage quota: %s of %s is used and the "
+                               "import needs %s." % (human(used), human(sc.quota), human(need)))
+        free = self.free_bytes(sc)
+        if free - need < self.s.reserve:
+            raise ApiError(507, "Not enough space: the import needs %s and %s is free after the reserve."
+                           % (human(need), human(max(0, free - self.s.reserve))))
+        log.info("s3-import tenant=%s user=%s endpoint=%s bucket=%s key=%r size=%d item=%s",
+                 sc.label, user, client.endpoint, client.bucket, key, size, item)
+        return self._start_job(sc, "s3-import", item, user, self._s3_import, client, key, filename, size, description, mode)
+
+    def _s3_import(self, job, sc, item, client, key, filename, size, description, mode):
+        job.step("Downloading %s from bucket %s (%s)" % (key, client.bucket, human(size)))
+        job.progress = {"done": 0, "total": size}
+        tmp = os.path.join(sc.uploads, "s3-%s.part" % job.id)
+        try:
+            integrity = client.download(key, tmp, size, progress=lambda d, t: job.__setattr__("progress", {"done": d, "total": t}),
+                                        cancelled=lambda: job.cancel_requested)
+        except S3.S3Cancelled:
+            self._unlink(tmp)
+            raise V.ValidationError("Import cancelled; nothing was published.")
+        except S3.S3Error as exc:
+            self._unlink(tmp)
+            raise V.ValidationError("The S3 download failed: %s" % exc)
+        except Exception:
+            self._unlink(tmp)
+            raise
+        job.progress = None
+        job.note("Checksum: MD5 matches the S3 ETag." if integrity["verified"] == "md5" else
+                 "The S3 ETag is not a plain MD5 (multipart or KMS-encrypted object); the content is checked "
+                 "by its file header and, for OVAs, the OVF manifest.")
+        reason = V.sniff(tmp, V.ext_of(filename), size, True)
+        if reason:
+            self._unlink(tmp)
+            raise V.ValidationError("%s was rejected because %s." % (filename, reason))
+        dest = os.path.join(sc.ready, item)
+        os.makedirs(dest, mode=0o750, exist_ok=True)
+        os.replace(tmp, os.path.join(dest, filename))
+        return self._publish(job, sc, item, description, mode)
+
+    @staticmethod
+    def _unlink(path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def cancel_job(self, sc, jid):
+        with self._jobs_guard:
+            job = self.jobs.get(jid)
+        if not job or job.tenant != sc.tenant:
+            raise ApiError(404, "Unknown job.")
+        if job.kind != "s3-import" or job.state != "running" or job.progress is None:
+            raise ApiError(409, "Only an import that is still downloading can be cancelled.")
+        job.cancel_requested = True
+        log.info("s3-cancel tenant=%s item=%s job=%s", sc.label, job.item, job.id[:8])
+        return job.public()
+
     # -------- housekeeping
     def _janitor(self):
         while True:
@@ -751,6 +908,7 @@ class Portal:
                             path = os.path.join(sc.uploads, name)
                             if name.endswith(".part") and now - os.path.getmtime(path) > self.s.ttl:
                                 self._discard(sc, name[:-5])
+                                self._unlink(path)
                                 log.info("janitor: tenant=%s removed abandoned upload %s", sc.label, name)
                     if os.path.isdir(sc.ready):
                         for item in os.listdir(sc.ready):
@@ -782,6 +940,9 @@ ROUTES = [
     ("POST", re.compile(r"^/api/items/%s/publish$" % ITEM), "publish"),
     ("DELETE", re.compile(r"^/api/items/%s$" % ITEM), "delete_item"),
     ("GET", re.compile(r"^/api/jobs/%s$" % ID), "job"),
+    ("DELETE", re.compile(r"^/api/jobs/%s$" % ID), "job_cancel"),
+    ("POST", re.compile(r"^/api/s3/list$"), "s3_list"),
+    ("POST", re.compile(r"^/api/s3/import$"), "s3_import"),
 ]
 RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 USER_RE = re.compile(r"[^A-Za-z0-9._@\\-]")
@@ -924,6 +1085,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_job(self, sc, jid):
         return self.portal.job(sc, jid)
+
+    def h_job_cancel(self, sc, jid):
+        return self.portal.cancel_job(sc, jid)
+
+    def h_s3_list(self, sc):
+        return self.portal.s3_list(sc, self._json(), self._user())
+
+    def h_s3_import(self, sc):
+        return self.portal.s3_import(sc, self._json(), self._user())
 
 
 class Server(ThreadingHTTPServer):

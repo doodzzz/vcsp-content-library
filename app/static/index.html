@@ -49,13 +49,67 @@
           <textarea id="item-desc" rows="2" maxlength="2000"></textarea>
         </div>
 
-        <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="drop-types">
-          <p class="drop-title">Drop files here or <span class="linkish">choose files</span></p>
-          <p class="drop-types" id="drop-types">Loading allowed file types</p>
-          <input type="file" id="file-input" multiple hidden>
+        <div class="source-switch" id="source-switch" role="radiogroup" aria-label="Where the files come from" hidden>
+          <label><input type="radio" name="source" value="upload" checked> Upload files</label>
+          <label><input type="radio" name="source" value="s3"> Import from S3</label>
         </div>
 
-        <ul class="queue" id="queue"></ul>
+        <div id="src-upload">
+          <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="drop-types">
+            <p class="drop-title">Drop files here or <span class="linkish">choose files</span></p>
+            <p class="drop-types" id="drop-types">Loading allowed file types</p>
+            <input type="file" id="file-input" multiple hidden>
+          </div>
+          <ul class="queue" id="queue"></ul>
+        </div>
+
+        <div id="src-s3" hidden>
+          <div class="field">
+            <label for="s3-endpoint">S3 endpoint</label>
+            <select id="s3-endpoint"></select>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="s3-bucket">Bucket</label>
+              <input id="s3-bucket" spellcheck="false" autocapitalize="off" autocomplete="off" maxlength="63">
+            </div>
+            <div class="field">
+              <label for="s3-region">Region</label>
+              <input id="s3-region" spellcheck="false" autocapitalize="off" autocomplete="off" maxlength="32">
+            </div>
+          </div>
+          <div class="field">
+            <label for="s3-prefix">Folder prefix <span class="optional">(optional)</span></label>
+            <input id="s3-prefix" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="images/templates/">
+          </div>
+          <div class="field">
+            <label for="s3-access">Access key ID</label>
+            <input id="s3-access" spellcheck="false" autocapitalize="off" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="s3-secret">Secret access key</label>
+            <input id="s3-secret" type="password" autocomplete="off">
+          </div>
+          <details class="field s3-advanced">
+            <summary>Advanced</summary>
+            <label for="s3-token">Session token <span class="optional">(temporary credentials only)</span></label>
+            <input id="s3-token" type="password" autocomplete="off">
+            <fieldset class="mode">
+              <legend>Addressing style</legend>
+              <label><input type="radio" name="s3-addressing" value="path"> Path (https://endpoint/bucket/key)</label>
+              <label><input type="radio" name="s3-addressing" value="virtual"> Virtual-hosted (https://bucket.endpoint/key)</label>
+            </fieldset>
+          </details>
+          <p class="field-help">Your keys are used only for this listing and import and are never stored.</p>
+          <div class="actions">
+            <button type="button" id="s3-list" class="btn">List OVA and ISO files</button>
+          </div>
+          <p class="field-help" id="s3-status" role="status"></p>
+          <ul class="s3-objects" id="s3-objects" aria-label="Objects in the bucket"></ul>
+          <div class="actions" id="s3-more-row" hidden>
+            <button type="button" id="s3-more" class="btn quiet">Load more</button>
+          </div>
+        </div>
 
         <div class="actions">
           <button type="submit" id="upload-btn" class="btn primary" disabled>Upload and publish</button>

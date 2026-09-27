@@ -16,7 +16,10 @@
     stale: "Serving previous version", pending: "Indexing",
   };
 
-  const S = { config: null, items: [], pending: { uploads: [], ready: [] }, queue: [], busy: false, nameRe: null, auth: null };
+  const S = {
+    config: null, items: [], pending: { uploads: [], ready: [] }, queue: [], busy: false, nameRe: null, auth: null,
+    source: "upload", s3: { objects: [], next: null, selected: null, conn: null },
+  };
 
   function basicAuth(user, password) {
     const bytes = new TextEncoder().encode(`${user}:${password}`);
@@ -130,6 +133,142 @@
     $("#file-input").setAttribute("accept", exts.join(","));
     setVersion(c.lib_version);
     setQuota(c);
+    setupS3(c.s3 || {});
+  }
+
+  // ------------------------------------------------------------------ S3 import
+  function setupS3(s3) {
+    $("#source-switch").hidden = !s3.enabled;
+    if (!s3.enabled) { setSource("upload"); return; }
+    const select = $("#s3-endpoint");
+    const current = select.value;
+    select.replaceChildren(...s3.endpoints.map((e) => el("option", { value: e, text: e })));
+    if (s3.endpoints.includes(current)) select.value = current;
+    if (!$("#s3-region").value) $("#s3-region").value = s3.region || "us-east-1";
+    if (!document.querySelector('input[name="s3-addressing"]:checked')) {
+      const radio = document.querySelector(`input[name="s3-addressing"][value="${s3.addressing === "virtual" ? "virtual" : "path"}"]`);
+      if (radio) radio.checked = true;
+    }
+  }
+
+  function setSource(source) {
+    S.source = source;
+    const radio = document.querySelector(`input[name="source"][value="${source}"]`);
+    if (radio) radio.checked = true;
+    $("#src-upload").hidden = source !== "upload";
+    $("#src-s3").hidden = source !== "s3";
+    updateButtons();
+  }
+
+  function s3Connection() {
+    const addressing = document.querySelector('input[name="s3-addressing"]:checked');
+    return {
+      endpoint: $("#s3-endpoint").value,
+      region: $("#s3-region").value.trim(),
+      bucket: $("#s3-bucket").value.trim(),
+      access_key: $("#s3-access").value.trim(),
+      secret_key: $("#s3-secret").value,
+      session_token: $("#s3-token").value.trim(),
+      addressing: addressing ? addressing.value : "path",
+    };
+  }
+
+  function s3Status(text, isError = false) {
+    const st = $("#s3-status");
+    st.textContent = text;
+    st.classList.toggle("is-error", isError);
+  }
+
+  async function listS3(more) {
+    if (S.busy) return;
+    const conn = more ? S.s3.conn : { ...s3Connection(), prefix: $("#s3-prefix").value.trim() };
+    if (!conn.bucket || !conn.access_key || !conn.secret_key) {
+      return s3Status("Enter the bucket, access key ID and secret access key.", true);
+    }
+    const btn = $("#s3-list");
+    btn.disabled = true;
+    s3Status(more ? "Loading more objects" : "Connecting and listing the bucket");
+    try {
+      const page = await api("s3/list", { method: "POST", body: { ...conn, continuation: more ? S.s3.next : null } });
+      if (!more) {
+        S.s3.objects = [];
+        S.s3.selected = null;
+      }
+      S.s3.conn = conn;
+      S.s3.objects = S.s3.objects.concat(page.objects);
+      S.s3.next = page.next;
+      renderS3();
+      const count = S.s3.objects.length;
+      s3Status(count
+        ? `${count} OVA or ISO file${count === 1 ? "" : "s"} found${page.next ? " so far" : ""}. Choose one to import.`
+        : `No OVA or ISO files found${conn.prefix ? " under " + conn.prefix : ""}${page.next ? " yet; load more to keep looking" : ""}.`);
+    } catch (e) {
+      s3Status(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderS3() {
+    const list = $("#s3-objects");
+    list.replaceChildren(...S.s3.objects.map((o, i) => {
+      const input = el("input", { type: "radio", name: "s3-object", value: String(i) });
+      if (S.s3.selected === o) input.checked = true;
+      input.addEventListener("change", () => selectS3(o));
+      const modified = o.modified ? new Date(o.modified).toLocaleDateString() : "";
+      return el("li", {}, el("label", {},
+        input,
+        el("span", { class: "s3-key", text: o.key }),
+        el("span", { class: "s3-meta", text: `${fmtBytes(o.size)}${modified ? "  " + modified : ""}` })));
+    }));
+    $("#s3-more-row").hidden = !S.s3.next;
+    updateButtons();
+  }
+
+  function selectS3(obj) {
+    S.s3.selected = obj;
+    const nameField = $("#item-name");
+    if (!nameField.value.trim()) {
+      const stem = obj.key.split("/").pop().replace(/\.[^.]+$/, "");
+      nameField.value = stem.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 80);
+      onItemName();
+    }
+    updateButtons();
+  }
+
+  function clearS3(all) {
+    S.s3 = { objects: [], next: null, selected: null, conn: null };
+    $("#s3-objects").replaceChildren();
+    $("#s3-more-row").hidden = true;
+    s3Status("");
+    if (all) for (const id of ["#s3-bucket", "#s3-prefix", "#s3-access", "#s3-secret", "#s3-token"]) $(id).value = "";
+  }
+
+  async function importS3(item, mode) {
+    const obj = S.s3.selected;
+    S.busy = true;
+    $("#job").hidden = true;
+    updateButtons();
+    const btn = $("#upload-btn");
+    btn.textContent = "Importing";
+    try {
+      const body = { ...S.s3.conn, key: obj.key, item, mode, description: $("#item-desc").value };
+      const job = await runJob(await api("s3/import", { method: "POST", body }));
+      if (job.state === "done") {
+        const v = job.result.item_versions.length ? ` as version ${job.result.item_versions.join(", ")}` : "";
+        toast(`Imported ${obj.key.split("/").pop()} and published ${item}${v}. Library version is now ${job.result.lib_version}.`);
+        S.s3.selected = null;
+        renderS3();
+        $("#item-desc").value = "";
+        $("#item-name").value = "";
+      }
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      S.busy = false;
+      updateButtons();
+      refreshAll();
+    }
   }
 
   function setQuota(c) {
@@ -344,6 +483,12 @@
     const validName = name && S.nameRe && S.nameRe.test(name);
     const staged = readyFilesFor(name).length > 0;
     const btn = $("#upload-btn");
+    if (S.source === "s3") {
+      btn.textContent = "Import and publish";
+      btn.disabled = S.busy || !validName || !S.s3.selected;
+      $("#clear-btn").disabled = true;
+      return;
+    }
     btn.textContent = S.queue.length ? "Upload and publish" : "Publish";
     btn.disabled = S.busy || !validName || (!S.queue.length && !staged);
     $("#clear-btn").disabled = S.busy || !S.queue.length;
@@ -424,6 +569,21 @@
       panel.classList.toggle("is-done", j.state === "done");
       const kids = [el("ol", {}, ...j.steps.map((s) => el("li", { text: s })))];
       for (const n of j.notes) kids.push(el("div", { class: "job-note", text: n }));
+      if (j.progress && j.state === "running") {
+        const bar = el("span");
+        bar.style.width = (j.progress.total ? (j.progress.done / j.progress.total) * 100 : 0).toFixed(1) + "%";
+        kids.push(el("div", { class: "job-progress" }, bar));
+        kids.push(el("div", { class: "job-progress-text", text: `${fmtBytes(j.progress.done)} of ${fmtBytes(j.progress.total)} downloaded` }));
+      }
+      if (j.cancellable) {
+        kids.push(el("div", { class: "actions" }, el("button", {
+          class: "btn quiet", type: "button", text: "Cancel import",
+          onclick: async (ev) => {
+            ev.target.disabled = true;
+            try { await api("jobs/" + j.id, { method: "DELETE" }); } catch (e) { toast(e.message, true); }
+          },
+        })));
+      }
       if (j.state === "failed") kids.push(el("div", { class: "job-result", text: j.error }));
       if (j.state === "done" && j.result) {
         const r = j.result;
@@ -450,6 +610,15 @@
     if (!S.nameRe.test(item) || S.busy) return;
     const existing = S.items.find((i) => i.name === item);
     const mode = existing ? document.querySelector('input[name="mode"]:checked').value : "replace";
+    if (S.source === "s3") {
+      if (!S.s3.selected) return;
+      if (existing && mode === "replace") {
+        const ok = await confirmDialog(`Replace every file of ${item}?`,
+          `The item's current files are replaced by ${S.s3.selected.key.split("/").pop()} from S3.`, "Replace", false);
+        if (!ok) return;
+      }
+      return importS3(item, mode);
+    }
     if (existing && mode === "replace" && S.queue.length) {
       const ok = await confirmDialog(`Replace every file of ${item}?`,
         `The item's current files are replaced by the ${S.queue.length} file(s) you selected.`, "Replace", false);
@@ -525,6 +694,13 @@
     });
     setInterval(() => { if (S.auth && !S.busy && document.visibilityState === "visible") refreshAll(); }, 30000);
     $("#signin-form").addEventListener("submit", signIn);
+    document.querySelectorAll('input[name="source"]').forEach((r) =>
+      r.addEventListener("change", () => { if (S.busy) { setSource(S.source); return; } setSource(r.value); }));
+    $("#s3-list").addEventListener("click", () => listS3(false));
+    $("#s3-more").addEventListener("click", () => listS3(true));
+    for (const id of ["#s3-endpoint", "#s3-bucket", "#s3-region", "#s3-prefix"]) {
+      $(id).addEventListener("change", () => clearS3(false));
+    }
     $("#signin").addEventListener("cancel", (e) => e.preventDefault());   // sign-in cannot be dismissed
     $("#signout").addEventListener("click", () => {
       if (S.busy) return toast("Wait for the current upload to finish.", true);
@@ -576,6 +752,8 @@
     $("#job").hidden = true;
     $("#lib-user").textContent = "";
     $("#signout").hidden = true;
+    clearS3(true);
+    setSource("upload");
     showSignIn(message);
   }
 

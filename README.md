@@ -31,6 +31,7 @@ Everything runs on the Python 3 standard library and the Photon OS base reposito
 | `bin/vcsp-index` | The indexer that generates `lib.json`, `items.json` and every `item.json`. |
 | `app/vcsp_upload.py` | Upload portal backend (resumable chunked uploads, publish and delete jobs). |
 | `app/vcsp_validate.py` | Content checks: extension allow-list, magic bytes, OVA extraction, OVF and manifest validation. |
+| `app/vcsp_s3.py` | S3 client for imports: AWS Signature V4, bucket listing, resumable verified downloads (standard library only). |
 | `app/static/` | Portal web interface (HTML, CSS, JavaScript; no external assets). |
 | `systemd/` | Hardened units for the backend and the indexer timer. |
 | `tests/test_vcsp.py` | End-to-end tests (`python3 tests/test_vcsp.py -v`, no root needed). |
@@ -101,7 +102,7 @@ VCSP_ADMIN_USER=libadmin VCSP_ADMIN_PASSWORD='...' VCSP_LIB_PASSWORD='...' \
   ./deploy.sh install --non-interactive
 ```
 
-Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (sixteen checks covering TLS, authentication, the backend and the index, one more when embedding is enabled, plus five per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (sixteen checks covering TLS, authentication, the backend and the index, one more when embedding is enabled, one per allowed S3 endpoint, plus five per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
 
 Photon OS ships `/srv` as a symbolic link to `/var/srv`, so with the default `DATA_ROOT=/srv/vcsp` the library physically lives in `/var/srv/vcsp/lib`. The installer resolves links in `DATA_ROOT` and `STATE_DIR` and gives nginx and systemd the real paths; links above the library are fine, but `lib/` and `staging/` themselves must be real folders or bind mounts.
 
@@ -191,6 +192,25 @@ Tenant names use 3-32 lowercase letters, digits and hyphens (they appear in URLs
 
 **How isolation is enforced.** nginx holds one generated file per active tenant in `/etc/nginx/vcsp-tenants/`, each authenticating against that tenant's own password files, so a tenant's credentials are refused everywhere else (tested as a full matrix: every administrator and library password works only in its own scope). For API calls nginx stamps the tenant name in a header, overwriting anything the browser sends, and adds a secret key from `/etc/vcsp/proxy.key`; the backend rejects any request without that key, so local users cannot reach it around nginx. Inside the backend every path, lock, upload, job and quota is derived from that stamped tenant, and jobs of one tenant are invisible to another. Each tenant has its own library ID and version sequence, and the indexer timer (`vcsp-index --all`) processes the provider library and each active tenant with separate locks.
 
+## Importing from S3
+
+Tenant administrators can also pull an OVA or ISO straight from an S3 bucket instead of uploading it from their workstation. In the portal (standalone or inside Cloud Director) they switch to **Import from S3**, pick an endpoint, enter the bucket, an optional folder prefix and their own access key and secret, list the OVA and ISO files, choose one, and **Import and publish**. The server downloads it into that tenant's staging area and then runs exactly the same pipeline as an upload: content check, OVA unpacking, OVF completeness and manifest verification, atomic publish, index update. The job shows download progress and can be cancelled while it downloads.
+
+The feature is off until the provider lists the permitted endpoints, which works with Amazon S3 and with S3-compatible on-premises object storage:
+
+```bash
+S3_ALLOWED_ENDPOINTS="https://s3.example.local"     # tenants can only choose from this list
+S3_CA_FILE="/etc/vcsp/s3-ca.pem"                    # if a private CA signs the endpoint's certificate
+S3_DEFAULT_REGION="us-east-1"
+S3_ADDRESSING="path"                                # or virtual (https://bucket.endpoint)
+```
+
+Then run `deploy.sh install`; `verify` checks that each endpoint answers with a certificate the server trusts. The library server needs outbound HTTPS to the endpoints (Photon OS allows outbound traffic by default; network firewalls must allow it too).
+
+How it stays safe: tenants choose from the provider's endpoint list and cannot type an address, so the server cannot be pointed at internal systems; bucket names and regions are validated before they become part of a request; redirects are never followed; certificates are always verified. Tenant keys are sent with each request, used for that one listing or import, held only in memory and never written to disk or logs (the audit log records user, endpoint, bucket, object and size). Quota and free space are checked before anything is downloaded. Integrity: when S3 exposes a plain MD5 ETag the download is checked against it; for multipart or KMS-encrypted objects the file header check and, for OVAs, the OVF manifest cover integrity. Interrupted downloads resume with HTTP range requests.
+
+`tests/test_vcsp.py` includes a live test you can point at your own object storage: set `VCSP_TEST_S3_ENDPOINT`, `VCSP_TEST_S3_BUCKET`, `VCSP_TEST_S3_ACCESS_KEY`, `VCSP_TEST_S3_SECRET_KEY`, `VCSP_TEST_S3_KEY` (and optionally `VCSP_TEST_S3_CA_FILE`) and run `python3 tests/test_vcsp.py S3LiveTests -v`.
+
 ## Inside Cloud Director (UI plug-in)
 
 `vcd-plugin/` holds a small Cloud Director 10.6 UI plug-in, **Library Upload**, that shows the upload portal inside the Cloud Director tenant portal (under **More**), so tenant administrators stay in their Cloud Director session. It opens `https://<SERVER_FQDN>/tenants/<organization name in lowercase>/upload/` for tenants and the provider portal for System users; the portal still asks for the tenant's local portal credentials in its own sign-in form.
@@ -242,6 +262,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 | Browser | Strict Content-Security-Policy (no inline or eval script, no third-party origins), `nosniff`, no referrer. Nothing can be framed except the portal pages, and those only by `EMBED_ALLOWED_ORIGINS` (default: nobody). The portal signs in with its own form and sends credentials explicitly (never cookies or cached browser credentials); state-changing API calls also require a custom header and a same-origin `Origin`, so cross-site requests cannot act on a signed-in session. |
 | Uploads | Server-side extension allow-list, strict file and item name patterns, magic-byte checks on the first chunk, size limits, free-space reserve, OVA extraction that refuses traversal, links and devices, OVF completeness and manifest digest verification before anything reaches the library. |
 | Tenants | Separate password files, nginx locations, library, staging, index state and quota per tenant; nginx stamps the tenant on every API call and the backend accepts only requests carrying nginx's secret key; one tenant's jobs and uploads are invisible to others. |
+| S3 import | Endpoints only from the provider's allow-list (no tenant-supplied addresses), validated bucket names, no redirects, verified TLS; tenant keys used per request and never stored or logged; quota checked before download; downloaded content goes through the same validation as uploads. |
 | Processes | Backend and indexer run as the unprivileged `vcsp` user under systemd sandboxing (`ProtectSystem=strict`, empty capability set, `NoNewPrivileges`, write access limited to `DATA_ROOT` and `STATE_DIR`; the indexer also has no network). The backend listens on loopback only and refuses to run as root. |
 | Supply chain | Standard library only; offline bundle integrity by SHA-256 and RPM signature verification. Hash functions are called with `usedforsecurity=False`, so manifest checks keep working when OpenSSL runs in FIPS mode. |
 
@@ -279,6 +300,10 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 | `LIB_AUTH` | basic | `basic` (user `vcsp`) or `none`. |
 | `TENANT_DEFAULT_QUOTA_GB` | 0 | Quota for new tenants when `tenant-add` gets no `--quota-gb` (0 = unlimited). |
 | `EMBED_ALLOWED_ORIGINS` | empty | Cloud Director address(es) allowed to show the portal in a frame, for the UI plug-in (empty = no framing). |
+| `S3_ALLOWED_ENDPOINTS` | empty | S3 endpoints tenants may import from; empty turns the feature off. |
+| `S3_DEFAULT_REGION` | us-east-1 | Region pre-filled in the portal. |
+| `S3_ADDRESSING` | path | Default addressing style: `path` or `virtual`. |
+| `S3_CA_FILE` | empty | PEM bundle of a private CA that signs the S3 endpoints' certificates. |
 | `LIB_ALLOW_CIDRS` / `ADMIN_ALLOW_CIDRS` | empty | Space-separated addresses or CIDRs allowed to reach `/lib/` or the portal. |
 | `ALLOWED_EXTENSIONS` | ovf vmdk mf cert nvram iso ova | Upload allow-list. |
 | `UPLOAD_CHUNK_MB` | 64 | Size of each resumable upload request (1-512). |
@@ -315,6 +340,8 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 **A portal shows "Requests must come through the portal's web server".** The backend and nginx disagree on the proxy key, usually because the backend was restarted with an old key or the key file was edited. Re-run `/opt/vcsp/deploy.sh install`, which rewrites the nginx include from `/etc/vcsp/proxy.key` and restarts the backend.
 
 **`runuser: command not found` (deploy.sh 2.0.0 and earlier).** Photon OS builds util-linux without PAM, so it has no `runuser`. From 2.0.1 the script drops privileges with Python instead; copy the new `deploy.sh` and re-run `deploy.sh install` (it is idempotent). A `tenant-add` that failed on this error was rolled back, so simply run it again.
+
+**An S3 listing fails.** The portal shows the reason in plain words. "Not trusted" means the endpoint's CA is missing from `S3_CA_FILE`; "Cannot resolve" or "Cannot connect" means DNS or a firewall between the library server and the endpoint; "served from another region" means the region or addressing style needs changing; a key or signature message means the tenant's credentials are wrong.
 
 **The Library Upload page in Cloud Director is empty.** See the troubleshooting section of `vcd-plugin/README.md`; usually the Cloud Director address is missing from `EMBED_ALLOWED_ORIGINS` or the browser does not trust the library's certificate.
 

@@ -177,6 +177,31 @@ th:first-child, td:first-child { padding-left: 0; }
 .reason { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; max-width: 46ch; overflow-wrap: anywhere; }
 .empty { padding: var(--s6) 0; color: var(--muted); max-width: 52ch; }
 
+/* ------------------------------------------------ S3 import */
+.source-switch { display: flex; margin-bottom: var(--s4); border: 1px solid var(--rule-strong); border-radius: var(--radius); overflow: hidden; }
+.source-switch label { flex: 1; text-align: center; padding: 7px 10px; font-size: var(--t-sm); font-weight: 600; cursor: pointer; background: var(--surface); }
+.source-switch label + label { border-left: 1px solid var(--rule-strong); }
+.source-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.source-switch label:has(input:checked) { background: var(--ink); color: var(--paper); }
+.source-switch label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
+.field select, .field input[type="password"], .s3-advanced input {
+  width: 100%; background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius); padding: 7px 10px; line-height: 1.4;
+}
+#s3-endpoint, #s3-bucket, #s3-region, #s3-prefix, #s3-access { font-family: var(--mono); font-size: 13px; }
+.s3-advanced summary { cursor: pointer; font-size: var(--t-sm); font-weight: 600; margin-bottom: var(--s2); }
+.s3-advanced .mode { margin-top: var(--s3); }
+.s3-objects { list-style: none; margin: var(--s2) 0 0; padding: 0; max-height: 280px; overflow-y: auto; border-top: 1px solid var(--rule); }
+.s3-objects li { border-bottom: 1px solid var(--rule); }
+.s3-objects label { display: grid; grid-template-columns: auto 1fr auto; gap: var(--s2) var(--s3); align-items: baseline; padding: var(--s2) var(--s1); cursor: pointer; }
+.s3-objects label:hover { background: var(--accent-soft); }
+.s3-objects input { accent-color: var(--accent); }
+.s3-key { font-family: var(--mono); font-size: var(--t-sm); overflow-wrap: anywhere; }
+.s3-meta { font-size: var(--t-xs); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.job .job-progress { height: 4px; background: var(--rule); margin-top: var(--s2); overflow: hidden; }
+.job .job-progress > span { display: block; height: 100%; background: var(--accent); transition: width 300ms linear; }
+.job .job-progress-text { margin-top: var(--s1); color: var(--muted); font-variant-numeric: tabular-nums; }
+
 /* ------------------------------------------------ dialogs (sign-in, confirmations) */
 .modal {
   border: 0; border-radius: 6px; padding: var(--s5); width: min(420px, calc(100vw - 32px));

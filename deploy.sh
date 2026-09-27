@@ -34,7 +34,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="2.1.0"
+readonly VCSP_VERSION="2.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -116,6 +116,7 @@ load_config() {
   DATA_ROOT=/srv/vcsp; STATE_DIR=/var/lib/vcsp; LIB_AUTH=basic; LIB_ALLOW_CIDRS=""; ADMIN_ALLOW_CIDRS=""
   UPLOAD_LISTEN=127.0.0.1; UPLOAD_PORT=8080; UPLOAD_CHUNK_MB=64; INDEX_INTERVAL=5min
   HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"; TENANT_DEFAULT_QUOTA_GB=0; EMBED_ALLOWED_ORIGINS=""
+  S3_ALLOWED_ENDPOINTS=""; S3_DEFAULT_REGION="us-east-1"; S3_ADDRESSING="path"; S3_CA_FILE=""
   local src=$CONF_FILE
   [[ -f $src ]] || src=$SCRIPT_DIR/config/vcsp.conf
   [[ -f $src ]] || die "no configuration found ($CONF_FILE or $SCRIPT_DIR/config/vcsp.conf)"
@@ -135,6 +136,15 @@ load_config() {
     [[ $origin =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] \
       || die "EMBED_ALLOWED_ORIGINS entry '$origin' must look like https://vcd.example.local (no path)"
   done
+  local ep
+  for ep in ${S3_ALLOWED_ENDPOINTS//,/ }; do
+    [[ $ep =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] \
+      || die "S3_ALLOWED_ENDPOINTS entry '$ep' must look like https://s3.example.local[:port] (no path)"
+    [[ $ep == https://* ]] || warn "S3 endpoint $ep is plain http; tenant keys and images would cross the network unencrypted"
+  done
+  [[ $S3_ADDRESSING == path || $S3_ADDRESSING == virtual ]] || die "S3_ADDRESSING must be path or virtual"
+  [[ $S3_DEFAULT_REGION =~ ^[a-z0-9-]{1,32}$ ]] || die "S3_DEFAULT_REGION must look like us-east-1"
+  [[ -z $S3_CA_FILE || -r $S3_CA_FILE ]] || die "S3_CA_FILE $S3_CA_FILE is not readable"
   local cidr
   for cidr in ${LIB_ALLOW_CIDRS//,/ } ${ADMIN_ALLOW_CIDRS//,/ }; do
     [[ $cidr =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || die "'$cidr' is not an IP address or CIDR"
@@ -431,7 +441,7 @@ install_payload() {
       "$VCSP_HOME/config" "$VCSP_HOME/tests"
     install -m 0755 "$SCRIPT_DIR/deploy.sh" "$VCSP_HOME/deploy.sh"
     install -m 0755 "$SCRIPT_DIR/bin/vcsp-index" "$VCSP_HOME/bin/vcsp-index"
-    install -m 0644 "$SCRIPT_DIR/app/vcsp_upload.py" "$SCRIPT_DIR/app/vcsp_validate.py" "$VCSP_HOME/app/"
+    install -m 0644 "$SCRIPT_DIR"/app/*.py "$VCSP_HOME/app/"       # every service module, including new ones
     install -m 0644 "$SCRIPT_DIR"/app/static/* "$VCSP_HOME/app/static/"
     install -m 0644 "$SCRIPT_DIR"/systemd/* "$VCSP_HOME/systemd/"
     install -m 0644 "$SCRIPT_DIR/config/vcsp.conf" "$VCSP_HOME/config/vcsp.conf"
@@ -439,7 +449,7 @@ install_payload() {
     [[ -f $SCRIPT_DIR/README.md ]] && install -m 0644 "$SCRIPT_DIR/README.md" "$VCSP_HOME/README.md"
   fi
   ln -sf "$VCSP_HOME/bin/vcsp-index" /usr/local/bin/vcsp-index
-  python3 -m py_compile "$VCSP_HOME/app/vcsp_upload.py" "$VCSP_HOME/app/vcsp_validate.py" \
+  python3 -m py_compile "$VCSP_HOME"/app/*.py \
     || die "python syntax check failed"
 
   if [[ ! -f $CONF_FILE ]]; then
@@ -1351,6 +1361,12 @@ probe_code() {  # probe_code HTPASSWD_FILE URL: HTTP status for a signed-in requ
   printf '%s' "$code"
 }
 
+s3_endpoint_ok() {  # TLS handshake succeeds and the endpoint answers HTTP (any status: S3 refuses anonymous calls)
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 ${S3_CA_FILE:+--cacert "$S3_CA_FILE"} "$1/" || true)
+  [[ $code =~ ^[1-5][0-9][0-9]$ ]]
+}
+
 json_401() {  # a failed API sign-in answers 401 with a JSON body the portal can display
   local headers
   headers=$(curl -sk --resolve "$SERVER_FQDN:443:127.0.0.1" -o /dev/null -D - "$1" || true)
@@ -1405,6 +1421,13 @@ verify() {
   if [[ -n ${EMBED_ALLOWED_ORIGINS// /} ]]; then
     check "portal may be framed by ${EMBED_ALLOWED_ORIGINS}" portal_frameable "$base/upload/"
   fi
+  local ep
+  if [[ -n $S3_CA_FILE ]]; then
+    check "S3 CA file is readable by the service user" as_user "$VCSP_USER" test -r "$S3_CA_FILE"
+  fi
+  for ep in ${S3_ALLOWED_ENDPOINTS//,/ }; do
+    check "S3 endpoint ${ep%/} is reachable with a trusted certificate" s3_endpoint_ok "${ep%/}"
+  done
   check "backend refuses requests that bypass nginx" \
     test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-VCSP-Tenant: _provider' "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/config" || true)" = 403
   if [[ -n $ADMIN_PW_VERIFY ]]; then

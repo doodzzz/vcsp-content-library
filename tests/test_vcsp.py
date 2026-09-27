@@ -123,6 +123,32 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("ova", settings.allowed)
 
 
+class S3SigningTests(unittest.TestCase):
+    def test_matches_aws_published_example(self):
+        """AWS S3 docs, 'GET Object' header-auth example (sig-v4-header-based-auth)."""
+        sys.path.insert(0, os.path.join(ROOT, "app"))
+        from datetime import datetime, timezone
+        from vcsp_s3 import EMPTY_SHA256, sign_v4
+        headers, canonical = sign_v4("GET", "examplebucket.s3.amazonaws.com", "/test.txt", {}, {"Range": "bytes=0-9"},
+                                     "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1",
+                                     payload_hash=EMPTY_SHA256, now=datetime(2013, 5, 24, tzinfo=timezone.utc))
+        self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(),
+                         "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972")
+        self.assertTrue(headers["authorization"].endswith(
+            "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"))
+
+    def test_rejects_unsafe_input(self):
+        sys.path.insert(0, os.path.join(ROOT, "app"))
+        from vcsp_s3 import S3Client, S3Error
+        for kw in ({"bucket": "../etc"}, {"bucket": "Bad_Bucket"}, {"region": "us east"},
+                   {"endpoint": "https://s3.example.local/path"}, {"endpoint": "ftp://s3.example.local"}):
+            args = dict(endpoint="https://s3.example.local", region="us-east-1", bucket="images",
+                        access_key="AK", secret_key="SK")
+            args.update(kw)
+            with self.assertRaises(S3Error, msg=kw):
+                S3Client(**args)
+
+
 class IndexerTests(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -421,6 +447,13 @@ class ServiceTests(unittest.TestCase):
         bad = subprocess.run([sys.executable, INDEX, "--config", self.env.conf, "--tenant", "nope"], capture_output=True)
         self.assertEqual(bad.returncode, 3)
 
+    def test_13_s3_import_disabled_by_default(self):
+        status, cfg = self.call("GET", "/api/config")
+        self.assertFalse(cfg["s3"]["enabled"])
+        status, res = self.call("POST", "/api/s3/list", {"endpoint": "https://s3.example.local", "bucket": "images"})
+        self.assertEqual(status, 403)
+        self.assertIn("not enabled", res["error"])
+
     def test_08_listing(self):
         status, cfg = self.call("GET", "/api/config")
         self.assertEqual(cfg["subscription_url"], "https://vcsp.test.local/lib/lib.json")
@@ -429,6 +462,67 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         by_name = {i["name"]: i for i in items["items"]}
         self.assertEqual(by_name["ubuntu"]["status"], "published")
+
+
+
+@unittest.skipUnless(os.environ.get("VCSP_TEST_S3_ENDPOINT"), "set VCSP_TEST_S3_* to test against a real S3 endpoint")
+class S3LiveTests(unittest.TestCase):
+    """Imports from a real S3 endpoint through the portal API. Environment:
+    VCSP_TEST_S3_ENDPOINT, VCSP_TEST_S3_BUCKET, VCSP_TEST_S3_ACCESS_KEY, VCSP_TEST_S3_SECRET_KEY,
+    VCSP_TEST_S3_KEY (an .ova or .iso object), optional VCSP_TEST_S3_REGION, VCSP_TEST_S3_CA_FILE."""
+
+    @classmethod
+    def setUpClass(cls):
+        e = os.environ
+        cls.env = Env()
+        with open(cls.env.conf, "a") as fh:
+            fh.write('S3_ALLOWED_ENDPOINTS="%s"\nS3_CA_FILE="%s"\nMAX_FILE_SIZE_GB="64"\n'
+                     % (e["VCSP_TEST_S3_ENDPOINT"], e.get("VCSP_TEST_S3_CA_FILE", "")))
+        cls.conn = {"endpoint": e["VCSP_TEST_S3_ENDPOINT"], "region": e.get("VCSP_TEST_S3_REGION", "us-east-1"),
+                    "bucket": e["VCSP_TEST_S3_BUCKET"], "access_key": e["VCSP_TEST_S3_ACCESS_KEY"],
+                    "secret_key": e["VCSP_TEST_S3_SECRET_KEY"], "addressing": e.get("VCSP_TEST_S3_ADDRESSING", "path")}
+        cls.key = e["VCSP_TEST_S3_KEY"]
+        cls.env.add_tenant("s3tenant")
+        cls.port = free_port()
+        cmd = [sys.executable, SERVICE, "--config", cls.env.conf, "--port", str(cls.port)]
+        if os.geteuid() == 0:
+            cmd.append("--allow-root")
+        cls.proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+        for _ in range(50):
+            try:
+                if ServiceTests.call.__func__(cls, "GET", "/api/health")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait(5)
+        cls.env.cleanup()
+
+    def call(self, *args, **kw):
+        kw.setdefault("tenant", "s3tenant")
+        return ServiceTests.call.__func__(type(self), *args, **kw)
+
+    def test_list_and_import(self):
+        status, page = self.call("POST", "/api/s3/list", dict(self.conn, prefix=self.key.rsplit("/", 1)[0] + "/" if "/" in self.key else ""))
+        self.assertEqual(status, 200, page)
+        self.assertIn(self.key, [o["key"] for o in page["objects"]])
+        status, job = self.call("POST", "/api/s3/import", dict(self.conn, key=self.key, item="s3-live-test"))
+        self.assertEqual(status, 200, job)
+        for _ in range(1200):
+            status, job = self.call("GET", "/api/jobs/" + job["id"])
+            if job["state"] != "running":
+                break
+            time.sleep(0.25)
+        self.assertEqual(job["state"], "done", job)
+        items = {i["name"] for i in self.env.lib_json("items.json", tenant="s3tenant")["items"]}
+        self.assertIn("s3-live-test", items)
+
+    def test_wrong_secret_is_reported(self):
+        status, res = self.call("POST", "/api/s3/list", dict(self.conn, secret_key="definitely-wrong"))
+        self.assertEqual(status, 502)
 
 
 if __name__ == "__main__":
