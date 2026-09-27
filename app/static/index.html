@@ -12,7 +12,7 @@
     <div class="plate-inner">
       <div>
         <h1 id="lib-name">Content library</h1>
-        <p class="plate-meta"><span id="lib-version">Library version not published yet</span><span id="lib-auth"></span><span id="lib-quota"></span></p>
+        <p class="plate-meta"><span id="lib-version">Library version not published yet</span><span id="lib-auth"></span><span id="lib-quota"></span><span id="lib-user"></span><button id="signout" type="button" class="btn link-plate" hidden>Sign out</button></p>
       </div>
       <div>
         <label for="sub-url" class="plate-label">Subscription URL</label>
@@ -98,6 +98,34 @@
       </div>
     </section>
   </main>
+
+  <dialog id="signin" class="modal" aria-labelledby="signin-title">
+    <form id="signin-form" method="dialog" novalidate>
+      <h2 id="signin-title">Sign in to the content library</h2>
+      <p class="modal-text">Use the portal credentials your provider gave you.</p>
+      <div class="field">
+        <label for="signin-user">User name</label>
+        <input id="signin-user" name="username" autocomplete="username" spellcheck="false" autocapitalize="off" required>
+      </div>
+      <div class="field">
+        <label for="signin-password">Password</label>
+        <input id="signin-password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <p class="field-help is-error" id="signin-error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="signin-submit" type="submit" class="btn primary">Sign in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm" class="modal" aria-labelledby="confirm-title">
+    <h2 id="confirm-title"></h2>
+    <p class="modal-text" id="confirm-text"></p>
+    <div class="actions">
+      <button id="confirm-cancel" type="button" class="btn quiet">Cancel</button>
+      <button id="confirm-ok" type="button" class="btn primary"></button>
+    </div>
+  </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>

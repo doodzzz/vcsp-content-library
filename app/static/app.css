@@ -177,6 +177,19 @@ th:first-child, td:first-child { padding-left: 0; }
 .reason { color: var(--muted); font-size: var(--t-xs); margin-top: 2px; max-width: 46ch; overflow-wrap: anywhere; }
 .empty { padding: var(--s6) 0; color: var(--muted); max-width: 52ch; }
 
+/* ------------------------------------------------ dialogs (sign-in, confirmations) */
+.modal {
+  border: 0; border-radius: 6px; padding: var(--s5); width: min(420px, calc(100vw - 32px));
+  background: var(--surface); color: var(--ink); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.modal::backdrop { background: rgba(19, 33, 43, 0.55); }
+.modal h2 { margin-bottom: var(--s2); }
+.modal .modal-text { color: var(--muted); font-size: var(--t-sm); margin-bottom: var(--s4); }
+.modal .field input { width: 100%; background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius); padding: 7px 10px; }
+.modal .actions { justify-content: flex-end; }
+.btn.danger-solid { background: var(--bad); color: #fff; border-color: var(--bad); }
+.btn.link-plate { background: transparent; border: 0; color: var(--plate-ink); padding: 0; text-decoration: underline; text-underline-offset: 2px; font-weight: 400; font-size: var(--t-sm); }
+
 .toast {
   position: fixed; left: 50%; bottom: var(--s5); transform: translateX(-50%);
   background: var(--ink); color: var(--paper); padding: var(--s3) var(--s4); border-radius: var(--radius);

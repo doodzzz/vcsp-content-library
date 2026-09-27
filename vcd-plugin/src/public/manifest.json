@@ -1,0 +1,30 @@
+{
+    "urn": "vcsp:content-library:library-upload",
+    "name": "Library Upload",
+    "manifestVersion": "4.0.0",
+    "containerVersion": "9.5.0",
+    "productVersions": ["10.6"],
+    "version": "1.0.0",
+    "scope": ["tenant", "service-provider"],
+    "permissions": [],
+    "description": "Opens the organization's content library upload portal inside VMware Cloud Director.",
+    "vendor": "VCSP Content Library",
+    "license": "Proprietary",
+    "link": "https://vcsp.example.local/",
+    "module": "LibraryUploadModule",
+    "route": "vcsp",
+    "extensionPoints": [{
+        "urn": "vcsp:content-library:library-upload:primary",
+        "type": "navigation:primary",
+        "name": "%nav.label%",
+        "description": "%nav.description%",
+        "module": "LibraryUploadModule",
+        "route": "library-upload"
+    }],
+    "locales": {
+        "en": {
+            "nav.label": "Library Upload",
+            "nav.description": "Upload templates and ISOs to your organization's content library"
+        }
+    }
+}

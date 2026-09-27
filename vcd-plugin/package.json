@@ -1,0 +1,39 @@
+{
+  "name": "vcsp-library-upload-plugin",
+  "version": "1.0.0",
+  "description": "VMware Cloud Director 10.6 UI plugin that opens the organization's VCSP content library upload portal inside Cloud Director",
+  "private": true,
+  "scripts": {
+    "build": "ng build",
+    "test": "node tools/test-portal-url.mjs"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@angular/animations": "17.1.2",
+    "@angular/common": "17.1.2",
+    "@angular/compiler": "17.1.2",
+    "@angular/core": "17.1.2",
+    "@angular/forms": "17.1.2",
+    "@angular/platform-browser": "17.1.2",
+    "@angular/platform-browser-dynamic": "17.1.2",
+    "@angular/router": "17.1.2",
+    "@cds/core": "6.9.2",
+    "@clr/angular": "17.0.1",
+    "@clr/ui": "17.0.1",
+    "@ngrx/store": "17.0.1",
+    "@vcd/bindings": "9.1.1",
+    "@vcd/i18n": "17.1.2",
+    "@vcd/sdk": "17.0.0",
+    "rxjs": "7.8.0",
+    "tslib": "2.3.0",
+    "zone.js": "0.14.3"
+  },
+  "devDependencies": {
+    "@angular-devkit/architect": "0.1701.2",
+    "@angular-devkit/build-angular": "17.1.2",
+    "@angular/cli": "17.1.2",
+    "@angular/compiler-cli": "17.1.2",
+    "@vcd/plugin-builders": "17.0.0",
+    "typescript": "5.3.3"
+  }
+}

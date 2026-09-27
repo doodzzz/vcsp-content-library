@@ -34,7 +34,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="2.0.1"
+readonly VCSP_VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -44,6 +44,7 @@ readonly TLS_DIR=$VCSP_ETC/tls
 readonly VCSP_USER=vcsp
 readonly NGINX_CONF=/etc/nginx/nginx.conf
 readonly NGINX_HEADERS=/etc/nginx/vcsp-headers.conf
+readonly NGINX_PORTAL_HEADERS=/etc/nginx/vcsp-headers-portal.conf      # portal pages: may be framed by EMBED_ALLOWED_ORIGINS
 readonly CRED_FILE=/root/vcsp-initial-credentials.txt
 readonly BUNDLE_CACHE=/var/cache/vcsp/bundle
 readonly TENANT_CONF_DIR=$VCSP_ETC/tenants                 # must match TENANT_CONF_DIR in the Python services
@@ -114,7 +115,7 @@ load_config() {
   LIB_NAME="Enterprise Content Library"; SERVER_FQDN="vcsp.example.local"; PUBLIC_BASE_URL=""
   DATA_ROOT=/srv/vcsp; STATE_DIR=/var/lib/vcsp; LIB_AUTH=basic; LIB_ALLOW_CIDRS=""; ADMIN_ALLOW_CIDRS=""
   UPLOAD_LISTEN=127.0.0.1; UPLOAD_PORT=8080; UPLOAD_CHUNK_MB=64; INDEX_INTERVAL=5min
-  HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"; TENANT_DEFAULT_QUOTA_GB=0
+  HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"; TENANT_DEFAULT_QUOTA_GB=0; EMBED_ALLOWED_ORIGINS=""
   local src=$CONF_FILE
   [[ -f $src ]] || src=$SCRIPT_DIR/config/vcsp.conf
   [[ -f $src ]] || die "no configuration found ($CONF_FILE or $SCRIPT_DIR/config/vcsp.conf)"
@@ -129,6 +130,11 @@ load_config() {
   fi
   [[ $UPLOAD_PORT =~ ^[0-9]+$ ]] || die "UPLOAD_PORT must be a number"
   [[ $TENANT_DEFAULT_QUOTA_GB =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TENANT_DEFAULT_QUOTA_GB must be a number of GiB"
+  local origin
+  for origin in ${EMBED_ALLOWED_ORIGINS//,/ }; do
+    [[ $origin =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+      || die "EMBED_ALLOWED_ORIGINS entry '$origin' must look like https://vcd.example.local (no path)"
+  done
   local cidr
   for cidr in ${LIB_ALLOW_CIDRS//,/ } ${ADMIN_ALLOW_CIDRS//,/ }; do
     [[ $cidr =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || die "'$cidr' is not an IP address or CIDR"
@@ -723,21 +729,22 @@ $lib_acl$lib_auth            limit_except GET {
             include $NGINX_HEADERS;
         }
 
-        # upload portal (static files)
+        # upload portal pages: generic static code with no data, served without a password so the
+        # portal can sign in with its own form (also inside VMware Cloud Director); the API checks
+        # credentials on every request
         location /upload/ {
             alias $VCSP_HOME/app/static/;
             index index.html;
-$admin_acl            auth_basic "VCSP upload portal";
-            auth_basic_user_file $VCSP_ETC/htpasswd-admin;
-            limit_req zone=vcsp_admin burst=60 nodelay;
+$admin_acl            limit_req zone=vcsp_admin burst=60 nodelay;
             add_header Cache-Control "no-cache" always;
-            include $NGINX_HEADERS;
+            include $NGINX_PORTAL_HEADERS;
         }
 
         # upload portal API - chunks stream to the backend without buffering
         location /upload/api/ {
 $admin_acl            auth_basic "VCSP upload portal";
             auth_basic_user_file $VCSP_ETC/htpasswd-admin;
+            error_page 401 = @vcsp_signin_required;
             limit_req zone=vcsp_admin burst=60 nodelay;
             client_max_body_size ${body_mb}m;
             proxy_pass http://vcsp_upload/api/;
@@ -753,6 +760,16 @@ $admin_acl            auth_basic "VCSP upload portal";
             proxy_set_header X-VCSP-Tenant "_provider";
             include $NGINX_PROXY_KEY_CONF;
             include $NGINX_HEADERS;
+        }
+
+        # failed API sign-in: a JSON 401 the portal shows in its own sign-in form. Browsers never
+        # open their password dialog for it because the portal sends credentials explicitly with
+        # fetch credentials "omit" (Fetch standard: no prompt without included credentials)
+        location @vcsp_signin_required {
+            default_type application/json;
+            add_header Cache-Control "no-store" always;
+            include $NGINX_HEADERS;
+            return 401 '{"error":"Sign-in required: the user name or password is incorrect."}';
         }
 
         # tenant libraries and portals: one generated file per active tenant
@@ -794,10 +811,22 @@ configure_proxy_key() {  # shared secret proving to vcsp-upload that a request c
   chmod 0600 "$NGINX_PROXY_KEY_CONF"
 }
 
+render_portal_headers() {  # like render_nginx_headers, but framing is allowed for EMBED_ALLOWED_ORIGINS
+  local ancestors="'none'" origins=${EMBED_ALLOWED_ORIGINS//,/ }
+  [[ -n ${origins// /} ]] && ancestors="'self' ${origins}"
+  echo "# Security headers for the upload portal pages (generated from EMBED_ALLOWED_ORIGINS)."
+  echo 'add_header X-Content-Type-Options "nosniff" always;'
+  [[ $ancestors == "'none'" ]] && echo 'add_header X-Frame-Options "DENY" always;'
+  echo 'add_header Referrer-Policy "no-referrer" always;'
+  echo 'add_header Strict-Transport-Security "max-age=31536000" always;'
+  printf 'add_header Content-Security-Policy "default-src '"'self'"'; img-src '"'self'"' data:; style-src '"'self'"'; script-src '"'self'"'; connect-src '"'self'"'; frame-ancestors %s; base-uri '"'none'"'; form-action '"'self'"'" always;\n' "$ancestors"
+}
+
 configure_nginx() {
   [[ -f $NGINX_CONF && ! -f $NGINX_CONF.photon-default ]] && cp -p "$NGINX_CONF" "$NGINX_CONF.photon-default"
   [[ -f $NGINX_CONF ]] && cp -p "$NGINX_CONF" "$NGINX_CONF.vcsp-previous"
   render_nginx_headers > "$NGINX_HEADERS"
+  render_portal_headers > "$NGINX_PORTAL_HEADERS"
   configure_proxy_key
   render_all_tenants
   render_nginx_conf > "$NGINX_CONF"
@@ -1005,16 +1034,15 @@ $lib_acl            auth_basic "VCSP library: $t";
         location /tenants/$t/upload/ {
             alias $VCSP_HOME/app/static/;
             index index.html;
-$admin_acl            auth_basic "VCSP portal: $t";
-            auth_basic_user_file $tdir/htpasswd-admin;
-            limit_req zone=vcsp_admin burst=60 nodelay;
+$admin_acl            limit_req zone=vcsp_admin burst=60 nodelay;
             add_header Cache-Control "no-cache" always;
-            include $NGINX_HEADERS;
+            include $NGINX_PORTAL_HEADERS;
         }
 
         location /tenants/$t/upload/api/ {
 $admin_acl            auth_basic "VCSP portal: $t";
             auth_basic_user_file $tdir/htpasswd-admin;
+            error_page 401 = @vcsp_signin_required;
             limit_req zone=vcsp_admin burst=60 nodelay;
             client_max_body_size ${body_mb}m;
             proxy_pass http://vcsp_upload/api/;
@@ -1323,6 +1351,20 @@ probe_code() {  # probe_code HTPASSWD_FILE URL: HTTP status for a signed-in requ
   printf '%s' "$code"
 }
 
+json_401() {  # a failed API sign-in answers 401 with a JSON body the portal can display
+  local headers
+  headers=$(curl -sk --resolve "$SERVER_FQDN:443:127.0.0.1" -o /dev/null -D - "$1" || true)
+  [[ $headers == *" 401"* ]] && grep -qi '^content-type: application/json' <<< "$headers"
+}
+
+portal_frameable() {  # the portal page allows every EMBED_ALLOWED_ORIGINS entry as a frame ancestor
+  local csp origin
+  csp=$(curl -sk --resolve "$SERVER_FQDN:443:127.0.0.1" -o /dev/null -D - "$1" | grep -i '^content-security-policy:' || true)
+  for origin in ${EMBED_ALLOWED_ORIGINS//,/ }; do
+    [[ $csp == *"frame-ancestors 'self'"*"$origin"* ]] || return 1
+  done
+}
+
 library_path_ok() {  # nginx refuses links below the document root
   local p
   for p in "$DATA_ROOT_REAL/lib" "$DATA_ROOT_REAL/lib/lib.json"; do
@@ -1357,7 +1399,12 @@ verify() {
       test "$(probe_code "$VCSP_ETC/htpasswd-library" "$base/lib/lib.json")" = 200
   fi
   check "hidden files are not served" test "$(http_code "$base/lib/.vcsp-probe")" = 404
-  check "portal requires sign-in" test "$(http_code "$base/upload/")" = 401
+  check "portal page loads" test "$(http_code "$base/upload/")" = 200
+  check "portal API requires sign-in" test "$(http_code "$base/upload/api/config")" = 401
+  check "failed API sign-in returns a JSON error for the portal" json_401 "$base/upload/api/config"
+  if [[ -n ${EMBED_ALLOWED_ORIGINS// /} ]]; then
+    check "portal may be framed by ${EMBED_ALLOWED_ORIGINS}" portal_frameable "$base/upload/"
+  fi
   check "backend refuses requests that bypass nginx" \
     test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-VCSP-Tenant: _provider' "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/config" || true)" = 403
   if [[ -n $ADMIN_PW_VERIFY ]]; then
@@ -1375,6 +1422,7 @@ verify() {
     check "tenant $t: lib.json without credentials returns 401" test "$(http_code "$base/tenants/$t/lib/lib.json")" = 401
     check "tenant $t: lib.json with valid credentials returns 200" \
       test "$(probe_code "$tdir/htpasswd-library" "$base/tenants/$t/lib/lib.json")" = 200
+    check "tenant $t: portal page loads" test "$(http_code "$base/tenants/$t/upload/")" = 200
     check "tenant $t: portal API answers for a signed-in user" \
       test "$(probe_code "$tdir/htpasswd-admin" "$base/tenants/$t/upload/api/config")" = 200
     check "tenant $t: provider administrators are refused" \
@@ -1459,7 +1507,7 @@ uninstall() {
   systemctl daemon-reload
   if [[ -f $NGINX_CONF.photon-default ]]; then
     cp -p "$NGINX_CONF.photon-default" "$NGINX_CONF"
-    rm -f "$NGINX_HEADERS" "$NGINX_PROXY_KEY_CONF"
+    rm -f "$NGINX_HEADERS" "$NGINX_PORTAL_HEADERS" "$NGINX_PROXY_KEY_CONF"
     rm -rf "$NGINX_TENANT_DIR"
     systemctl restart nginx || true
   fi

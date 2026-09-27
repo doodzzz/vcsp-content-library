@@ -1,4 +1,10 @@
-/* VCSP upload portal client: resumable chunked uploads, publish jobs, library view. No dependencies. */
+/* VCSP upload portal client: resumable chunked uploads, publish jobs, library view. No dependencies.
+ *
+ * Sign-in happens in the page, not through the browser's Basic-auth dialog: the
+ * portal is also shown inside VMware Cloud Director, where browsers suppress
+ * authentication dialogs for framed content from another origin. The same local
+ * credentials are sent explicitly on every request and checked by nginx; they
+ * live only in memory and are gone when the page is closed or reloaded. */
 "use strict";
 (() => {
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -10,7 +16,14 @@
     stale: "Serving previous version", pending: "Indexing",
   };
 
-  const S = { config: null, items: [], pending: { uploads: [], ready: [] }, queue: [], busy: false, nameRe: null };
+  const S = { config: null, items: [], pending: { uploads: [], ready: [] }, queue: [], busy: false, nameRe: null, auth: null };
+
+  function basicAuth(user, password) {
+    const bytes = new TextEncoder().encode(`${user}:${password}`);
+    let bin = "";
+    bytes.forEach((b) => { bin += String.fromCharCode(b); });
+    return "Basic " + btoa(bin);
+  }
 
   function el(tag, props = {}, ...kids) {
     const node = document.createElement(tag);
@@ -47,7 +60,8 @@
 
   // ------------------------------------------------------------------ API
   async function api(path, { method = "GET", body } = {}) {
-    const init = { method, credentials: "same-origin", headers: { "X-VCSP-Request": "1" } };
+    const init = { method, credentials: "omit", headers: { "X-VCSP-Request": "1" } };
+    if (S.auth) init.headers.Authorization = S.auth;
     if (body !== undefined) {
       init.body = JSON.stringify(body);
       init.headers["Content-Type"] = "application/json";
@@ -66,6 +80,7 @@
       const err = new Error(data.error || `The server answered ${res.status} ${res.statusText}.`);
       err.status = res.status;
       err.data = data;
+      if (res.status === 401 && S.auth && path !== "config") signOut("Your sign-in is no longer valid. Sign in again.");
       throw err;
     }
     return data;
@@ -77,6 +92,7 @@
       xhr.open("PUT", "api/uploads/" + id);
       xhr.timeout = 15 * 60 * 1000;
       xhr.setRequestHeader("X-VCSP-Request", "1");
+      if (S.auth) xhr.setRequestHeader("Authorization", S.auth);
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
       xhr.setRequestHeader("Content-Range", `bytes ${start}-${start + blob.size - 1}/${total}`);
       xhr.upload.onprogress = (e) => onProgress(e.loaded);
@@ -198,9 +214,9 @@
 
   async function deleteItem(item) {
     if (S.busy) return toast("Wait for the current upload to finish.", true);
-    const ok = window.confirm(
-      `Delete ${item.name} from the library?\n\nSubscribed catalogs remove it on their next sync. ` +
-      "VMs already deployed from it are not affected.");
+    const ok = await confirmDialog(`Delete ${item.name} from the library?`,
+      "Subscribed catalogs remove it on their next sync. VMs already deployed from it are not affected.",
+      "Delete", true);
     if (!ok) return;
     try {
       const job = await runJob(await api(`items/${encodeURIComponent(item.name)}`, { method: "DELETE" }));
@@ -435,7 +451,8 @@
     const existing = S.items.find((i) => i.name === item);
     const mode = existing ? document.querySelector('input[name="mode"]:checked').value : "replace";
     if (existing && mode === "replace" && S.queue.length) {
-      const ok = window.confirm(`Replace every file of ${item} with the ${S.queue.length} file(s) you selected?`);
+      const ok = await confirmDialog(`Replace every file of ${item}?`,
+        `The item's current files are replaced by the ${S.queue.length} file(s) you selected.`, "Replace", false);
       if (!ok) return;
     }
     S.busy = true;
@@ -506,17 +523,89 @@
     window.addEventListener("beforeunload", (e) => {
       if (S.busy) { e.preventDefault(); e.returnValue = ""; }
     });
-    setInterval(() => { if (!S.busy && document.visibilityState === "visible") refreshAll(); }, 30000);
+    setInterval(() => { if (S.auth && !S.busy && document.visibilityState === "visible") refreshAll(); }, 30000);
+    $("#signin-form").addEventListener("submit", signIn);
+    $("#signin").addEventListener("cancel", (e) => e.preventDefault());   // sign-in cannot be dismissed
+    $("#signout").addEventListener("click", () => {
+      if (S.busy) return toast("Wait for the current upload to finish.", true);
+      signOut("");
+    });
   }
 
-  async function start() {
-    wire();
+  // ------------------------------------------------------------------ sign-in and dialogs
+  function showSignIn(message) {
+    const dlg = $("#signin");
+    $("#signin-error").textContent = message || "";
+    $("#signin-error").hidden = !message;
+    $("#signin-password").value = "";
+    if (!dlg.open) dlg.showModal();
+    ($("#signin-user").value ? $("#signin-password") : $("#signin-user")).focus();
+  }
+
+  async function signIn(ev) {
+    ev.preventDefault();
+    const user = $("#signin-user").value.trim();
+    const password = $("#signin-password").value;
+    if (!user || !password) return;
+    const btn = $("#signin-submit");
+    btn.disabled = true;
+    S.auth = basicAuth(user, password);
     try {
       await loadConfig();
+      $("#signin").close();
+      $("#lib-user").textContent = `Signed in as ${S.config.user}`;
+      $("#signout").hidden = false;
       await refreshAll();
     } catch (e) {
-      toast(e.message, true);
+      S.auth = null;
+      showSignIn(e.status === 401 ? "The user name or password is incorrect." : e.message);
+    } finally {
+      btn.disabled = false;
     }
+  }
+
+  function signOut(message) {
+    S.auth = null;
+    S.config = null;
+    S.items = [];
+    S.queue = [];
+    S.pending = { uploads: [], ready: [] };
+    $("#items tbody").replaceChildren();
+    $("#queue").replaceChildren();
+    $("#pending").hidden = true;
+    $("#job").hidden = true;
+    $("#lib-user").textContent = "";
+    $("#signout").hidden = true;
+    showSignIn(message);
+  }
+
+  function confirmDialog(title, text, okLabel, danger) {
+    const dlg = $("#confirm");
+    $("#confirm-title").textContent = title;
+    $("#confirm-text").textContent = text;
+    const ok = $("#confirm-ok");
+    ok.textContent = okLabel;
+    ok.className = danger ? "btn danger-solid" : "btn primary";
+    return new Promise((resolve) => {
+      const done = (value) => {
+        dlg.removeEventListener("close", onClose);
+        ok.onclick = null;
+        $("#confirm-cancel").onclick = null;
+        if (dlg.open) dlg.close();
+        resolve(value);
+      };
+      const onClose = () => done(false);
+      dlg.addEventListener("close", onClose);
+      ok.onclick = () => done(true);
+      $("#confirm-cancel").onclick = () => done(false);
+      dlg.showModal();
+      $("#confirm-cancel").focus();
+    });
+  }
+
+  function start() {
+    wire();
+    showSignIn("");
   }
 
   start();

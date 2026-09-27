@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/@angular/cli/lib/config/schema.json",
+  "version": 1,
+  "newProjectRoot": "projects",
+  "projects": {
+    "uiPlugin": {
+      "projectType": "library",
+      "root": "",
+      "sourceRoot": "src",
+      "prefix": "lib",
+      "architect": {
+        "build": {
+          "builder": "@vcd/plugin-builders:plugin-builder",
+          "options": {
+            "modulePath": "src/main/library-upload.module.ts#LibraryUploadModule",
+            "outputPath": "dist/",
+            "index": "src/index.html",
+            "main": "src/plugin.main.ts",
+            "tsConfig": "tsconfig.json",
+            "assets": [{ "glob": "**/*", "input": "./src/public", "output": "/" }],
+            "optimization": false,
+            "outputHashing": "all",
+            "sourceMap": false,
+            "extractCss": false,
+            "namedChunks": false,
+            "aot": false,
+            "extractLicenses": false,
+            "vendorChunk": false,
+            "buildOptimizer": false
+          }
+        }
+      }
+    }
+  }
+}

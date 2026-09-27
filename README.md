@@ -34,6 +34,7 @@ Everything runs on the Python 3 standard library and the Photon OS base reposito
 | `app/static/` | Portal web interface (HTML, CSS, JavaScript; no external assets). |
 | `systemd/` | Hardened units for the backend and the indexer timer. |
 | `tests/test_vcsp.py` | End-to-end tests (`python3 tests/test_vcsp.py -v`, no root needed). |
+| `vcd-plugin/` | Cloud Director 10.6 UI plug-in that opens the portal inside Cloud Director (see its README). |
 | `docs/portal.png` | Screenshot of the upload portal. |
 | `docs/VCSP-Content-Library-Architecture.pptx` | Architecture deck: high-level and low-level design, diagrams as editable PowerPoint shapes. |
 
@@ -100,7 +101,7 @@ VCSP_ADMIN_USER=libadmin VCSP_ADMIN_PASSWORD='...' VCSP_LIB_PASSWORD='...' \
   ./deploy.sh install --non-interactive
 ```
 
-Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (fourteen checks covering TLS, authentication, the backend and the index, plus four per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (sixteen checks covering TLS, authentication, the backend and the index, one more when embedding is enabled, plus five per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
 
 Photon OS ships `/srv` as a symbolic link to `/var/srv`, so with the default `DATA_ROOT=/srv/vcsp` the library physically lives in `/var/srv/vcsp/lib`. The installer resolves links in `DATA_ROOT` and `STATE_DIR` and gives nginx and systemd the real paths; links above the library are fine, but `lib/` and `staging/` themselves must be real folders or bind mounts.
 
@@ -132,7 +133,7 @@ Content-Type: application/vnd.vmware.admin.externalCatalogSubscriptionParams+xml
 
 ## Using the upload portal
 
-Browse to `https://<SERVER_FQDN>/upload/` and sign in as a portal administrator. Enter an item name (it becomes the catalog item name), optionally a description, drop the files and choose Upload and publish. Only the extensions in `ALLOWED_EXTENSIONS` are accepted (default `.ovf .vmdk .mf .cert .nvram .iso .ova`); the browser checks them for convenience and the server enforces them.
+Browse to `https://<SERVER_FQDN>/upload/` (or open **Library Upload** inside Cloud Director, see below) and sign in as a portal administrator in the portal's own sign-in form. The page itself is generic code with no data and loads without a password; every API call carries the credentials, which nginx checks, and they are kept only in memory until the page is closed or reloaded. Enter an item name (it becomes the catalog item name), optionally a description, drop the files and choose Upload and publish. Only the extensions in `ALLOWED_EXTENSIONS` are accepted (default `.ovf .vmdk .mf .cert .nvram .iso .ova`); the browser checks them for convenience and the server enforces them.
 
 Files are sent in `UPLOAD_CHUNK_MB` pieces that stream straight to disk, so multi-hundred-gigabyte disks upload with constant memory and survive interruptions: after a dropped connection or a closed tab, choose the same file for the same item and the upload continues from the last byte the server holds. Each file's content is checked against its extension after the first chunk (a VMDK needs a sparse or streamOptimized header, an ISO an ISO 9660 or UDF descriptor, an OVA a tar header), so a mislabelled file is refused within seconds rather than after a long upload.
 
@@ -190,6 +191,12 @@ Tenant names use 3-32 lowercase letters, digits and hyphens (they appear in URLs
 
 **How isolation is enforced.** nginx holds one generated file per active tenant in `/etc/nginx/vcsp-tenants/`, each authenticating against that tenant's own password files, so a tenant's credentials are refused everywhere else (tested as a full matrix: every administrator and library password works only in its own scope). For API calls nginx stamps the tenant name in a header, overwriting anything the browser sends, and adds a secret key from `/etc/vcsp/proxy.key`; the backend rejects any request without that key, so local users cannot reach it around nginx. Inside the backend every path, lock, upload, job and quota is derived from that stamped tenant, and jobs of one tenant are invisible to another. Each tenant has its own library ID and version sequence, and the indexer timer (`vcsp-index --all`) processes the provider library and each active tenant with separate locks.
 
+## Inside Cloud Director (UI plug-in)
+
+`vcd-plugin/` holds a small Cloud Director 10.6 UI plug-in, **Library Upload**, that shows the upload portal inside the Cloud Director tenant portal (under **More**), so tenant administrators stay in their Cloud Director session. It opens `https://<SERVER_FQDN>/tenants/<organization name in lowercase>/upload/` for tenants and the provider portal for System users; the portal still asks for the tenant's local portal credentials in its own sign-in form.
+
+The portal signs in with its own form rather than the browser's password dialog because browsers suppress authentication dialogs for framed content from another origin; the form sends the same credentials explicitly and never triggers a browser prompt. Framing is off by default. To allow it, set `EMBED_ALLOWED_ORIGINS` to the Cloud Director address(es) users browse to and re-run `deploy.sh install`; only the portal pages become frameable, and only by those origins. Build the plug-in with `vcd-plugin/package.sh --portal-url https://<SERVER_FQDN>` and upload it in **Customize Portal**. The provider prerequisites (tenant name equals organization name in lowercase, `EMBED_ALLOWED_ORIGINS`, a certificate the browsers trust, reachability) are listed in `vcd-plugin/README.md`.
+
 ## Adding content without the portal
 
 Content can also be copied in directly, for example with `rsync` from a staging share. Create one folder per item under `DATA_ROOT/lib`, make sure the `vcsp` user owns it, and either wait for the timer or index immediately:
@@ -232,7 +239,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 | Transport | TLS 1.2/1.3 only, modern AEAD ciphers, HSTS. Self-signed certificate plus CSR on first install; `cert-install` swaps in a CA-signed one with key-match and SAN checks and automatic rollback. |
 | Subscribers | HTTP Basic user `vcsp` (VCSP requirement) with a SHA-512-crypt password hash; optional `LIB_ALLOW_CIDRS`; `/lib/` allows only GET/HEAD, no directory listing, no symbolic links inside the library, no dot-files. |
 | Portal | Separate administrator accounts (`add-admin`, `remove-admin`), optional `ADMIN_ALLOW_CIDRS`, rate limiting, audit lines with the user name for every upload, publish and delete in the journal. |
-| Browser | Strict Content-Security-Policy (no inline or eval script, no third-party origins), `X-Frame-Options DENY`, `nosniff`, no referrer. State-changing API calls require a custom header and a same-origin `Origin`, which blocks CSRF against cached Basic credentials. |
+| Browser | Strict Content-Security-Policy (no inline or eval script, no third-party origins), `nosniff`, no referrer. Nothing can be framed except the portal pages, and those only by `EMBED_ALLOWED_ORIGINS` (default: nobody). The portal signs in with its own form and sends credentials explicitly (never cookies or cached browser credentials); state-changing API calls also require a custom header and a same-origin `Origin`, so cross-site requests cannot act on a signed-in session. |
 | Uploads | Server-side extension allow-list, strict file and item name patterns, magic-byte checks on the first chunk, size limits, free-space reserve, OVA extraction that refuses traversal, links and devices, OVF completeness and manifest digest verification before anything reaches the library. |
 | Tenants | Separate password files, nginx locations, library, staging, index state and quota per tenant; nginx stamps the tenant on every API call and the backend accepts only requests carrying nginx's secret key; one tenant's jobs and uploads are invisible to others. |
 | Processes | Backend and indexer run as the unprivileged `vcsp` user under systemd sandboxing (`ProtectSystem=strict`, empty capability set, `NoNewPrivileges`, write access limited to `DATA_ROOT` and `STATE_DIR`; the indexer also has no network). The backend listens on loopback only and refuses to run as root. |
@@ -271,6 +278,7 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 | `STATE_DIR` | /var/lib/vcsp | Indexer state and lock. |
 | `LIB_AUTH` | basic | `basic` (user `vcsp`) or `none`. |
 | `TENANT_DEFAULT_QUOTA_GB` | 0 | Quota for new tenants when `tenant-add` gets no `--quota-gb` (0 = unlimited). |
+| `EMBED_ALLOWED_ORIGINS` | empty | Cloud Director address(es) allowed to show the portal in a frame, for the UI plug-in (empty = no framing). |
 | `LIB_ALLOW_CIDRS` / `ADMIN_ALLOW_CIDRS` | empty | Space-separated addresses or CIDRs allowed to reach `/lib/` or the portal. |
 | `ALLOWED_EXTENSIONS` | ovf vmdk mf cert nvram iso ova | Upload allow-list. |
 | `UPLOAD_CHUNK_MB` | 64 | Size of each resumable upload request (1-512). |
@@ -305,6 +313,10 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 **nginx does not start after enabling IPv6.** The host kernel has IPv6 disabled; set `LISTEN_IPV6=no` and re-run the installer.
 
 **A portal shows "Requests must come through the portal's web server".** The backend and nginx disagree on the proxy key, usually because the backend was restarted with an old key or the key file was edited. Re-run `/opt/vcsp/deploy.sh install`, which rewrites the nginx include from `/etc/vcsp/proxy.key` and restarts the backend.
+
+**`runuser: command not found` (deploy.sh 2.0.0 and earlier).** Photon OS builds util-linux without PAM, so it has no `runuser`. From 2.0.1 the script drops privileges with Python instead; copy the new `deploy.sh` and re-run `deploy.sh install` (it is idempotent). A `tenant-add` that failed on this error was rolled back, so simply run it again.
+
+**The Library Upload page in Cloud Director is empty.** See the troubleshooting section of `vcd-plugin/README.md`; usually the Cloud Director address is missing from `EMBED_ALLOWED_ORIGINS` or the browser does not trust the library's certificate.
 
 **A tenant URL returns 404.** The tenant does not exist or is suspended; check `deploy.sh tenant-list`.
 
