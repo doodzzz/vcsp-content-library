@@ -205,7 +205,7 @@ S3_DEFAULT_REGION="us-east-1"
 S3_ADDRESSING="path"                                # or virtual (https://bucket.endpoint)
 ```
 
-Then run `deploy.sh install`; `verify` checks that each endpoint answers with a certificate the server trusts. The library server needs outbound HTTPS to the endpoints (Photon OS allows outbound traffic by default; network firewalls must allow it too).
+Then run `deploy.sh install`; `verify` checks that each endpoint answers with a certificate the server trusts, and `install`, `verify` and `status` all state whether S3 import is on. After an upgrade the `S3_*` lines are already in the file with empty values, so you only fill them in. The **Import from S3** option appears in the portal after signing in, next to **Upload files**. The library server needs outbound HTTPS to the endpoints (Photon OS allows outbound traffic by default; network firewalls must allow it too).
 
 How it stays safe: tenants choose from the provider's endpoint list and cannot type an address, so the server cannot be pointed at internal systems; bucket names and regions are validated before they become part of a request; redirects are never followed; certificates are always verified. Tenant keys are sent with each request, used for that one listing or import, held only in memory and never written to disk or logs (the audit log records user, endpoint, bucket, object and size). Quota and free space are checked before anything is downloaded. Integrity: when S3 exposes a plain MD5 ETag the download is checked against it; for multipart or KMS-encrypted objects the file header check and, for OVAs, the OVF manifest cover integrity. Interrupted downloads resume with HTTP range requests.
 
@@ -284,7 +284,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 journalctl -u vcsp-upload -u vcsp-index -f     # audit trail and index runs
 ```
 
-After editing `/etc/vcsp/vcsp.conf`, run `/opt/vcsp/deploy.sh install` again; it is idempotent, keeps existing certificates and passwords, and re-renders nginx and systemd from the new values.
+When you install a newer release over an existing one, the installer keeps your `/etc/vcsp/vcsp.conf` and appends any settings introduced since your last install, with their comments and with defaults that keep behaviour unchanged; it lists the names it added. After editing `/etc/vcsp/vcsp.conf`, run `/opt/vcsp/deploy.sh install` again; it is idempotent, keeps existing certificates and passwords, and re-renders nginx and systemd from the new values.
 
 For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libraries in `tenants/`), `STATE_DIR` (IDs, versions and cached etags for every library) and `/etc/vcsp` (configuration, tenant definitions, password hashes, TLS and proxy keys). If the state file is lost, the indexer re-adopts IDs and versions from `items.json`, so subscribers are not disturbed. For monitoring, alert on `vcsp-index --check` returning 4, on `systemctl is-active vcsp-upload nginx`, and on free space in `DATA_ROOT`.
 
@@ -340,6 +340,8 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 **A portal shows "Requests must come through the portal's web server".** The backend and nginx disagree on the proxy key, usually because the backend was restarted with an old key or the key file was edited. Re-run `/opt/vcsp/deploy.sh install`, which rewrites the nginx include from `/etc/vcsp/proxy.key` and restarts the backend.
 
 **`runuser: command not found` (deploy.sh 2.0.0 and earlier).** Photon OS builds util-linux without PAM, so it has no `runuser`. From 2.0.1 the script drops privileges with Python instead; copy the new `deploy.sh` and re-run `deploy.sh install` (it is idempotent). A `tenant-add` that failed on this error was rolled back, so simply run it again.
+
+**The portal shows no Import from S3 option.** S3 import is off: `deploy.sh status` says so and names the setting. Set `S3_ALLOWED_ENDPOINTS` in `/etc/vcsp/vcsp.conf`, run `deploy.sh install`, then sign in to the portal again (the option only appears after sign-in).
 
 **An S3 listing fails.** The portal shows the reason in plain words. "Not trusted" means the endpoint's CA is missing from `S3_CA_FILE`; "Cannot resolve" or "Cannot connect" means DNS or a firewall between the library server and the endpoint; "served from another region" means the region or addressing style needs changing; a key or signature message means the tenant's credentials are wrong.
 

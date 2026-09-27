@@ -34,7 +34,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="2.2.0"
+readonly VCSP_VERSION="2.2.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -154,6 +154,34 @@ load_config() {
   # (disable_symlinks) and the systemd sandbox are always given the real directories.
   DATA_ROOT_REAL=$(realpath -m -- "$DATA_ROOT")
   STATE_DIR_REAL=$(realpath -m -- "$STATE_DIR")
+}
+
+merge_new_settings() {  # append settings introduced by this release, with the shipped defaults and comments
+  local sample=$SCRIPT_DIR/config/vcsp.conf line key added=() names=()
+  [[ -f $sample && $(realpath -- "$sample") != $(realpath -- "$CONF_FILE") ]] || return 0
+  while IFS= read -r line; do
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)= ]] || continue
+    key=${BASH_REMATCH[1]}
+    grep -q "^${key}=" "$CONF_FILE" && continue
+    added+=("$line")
+    names+=("$key")
+  done < "$sample"
+  (( ${#added[@]} )) || return 0
+  {
+    echo
+    echo "# ---- added by deploy.sh $VCSP_VERSION on $(date -u +%Y-%m-%d): settings new since your last install."
+    echo "# ---- Their defaults keep behaviour unchanged; see $VCSP_HOME/README.md for each one."
+    printf '%s\n' "${added[@]}"
+  } >> "$CONF_FILE"
+  info "Added new settings to $CONF_FILE with their defaults: ${names[*]}"
+}
+
+s3_status_line() {  # one line describing whether tenants can import from S3
+  if [[ -n ${S3_ALLOWED_ENDPOINTS// /} ]]; then
+    echo "S3 import: on for ${S3_ALLOWED_ENDPOINTS}"
+  else
+    echo "S3 import: off. To enable it, set S3_ALLOWED_ENDPOINTS in $CONF_FILE and run deploy.sh install"
+  fi
 }
 
 set_conf_value() {  # set_conf_value KEY VALUE (in the installed config)
@@ -455,6 +483,8 @@ install_payload() {
   if [[ ! -f $CONF_FILE ]]; then
     install -m 0640 -o root -g "$VCSP_USER" "$CONF_SOURCE" "$CONF_FILE"
     info "Configuration installed at $CONF_FILE"
+  else
+    merge_new_settings
   fi
   if [[ $SERVER_FQDN == vcsp.example.local ]]; then
     local detected
@@ -1428,6 +1458,7 @@ verify() {
   for ep in ${S3_ALLOWED_ENDPOINTS//,/ }; do
     check "S3 endpoint ${ep%/} is reachable with a trusted certificate" s3_endpoint_ok "${ep%/}"
   done
+  info "$(s3_status_line)"
   check "backend refuses requests that bypass nginx" \
     test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-VCSP-Tenant: _provider' "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/config" || true)" = 403
   if [[ -n $ADMIN_PW_VERIFY ]]; then
@@ -1475,6 +1506,7 @@ status() {
   echo "Prerequisites: ${missing:+missing: }${missing:-all installed}"
   echo "Subscription URL: ${PUBLIC_BASE_URL:-https://$SERVER_FQDN}/lib/lib.json"
   echo "Certificate SHA-256: $(fingerprint 2>/dev/null || echo unavailable)"
+  s3_status_line
   echo
   tenant_list
 }
