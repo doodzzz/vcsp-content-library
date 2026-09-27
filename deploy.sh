@@ -24,6 +24,10 @@
 #   ./deploy.sh tenant-set-library-password NAME
 #   ./deploy.sh tenant-suspend NAME | tenant-resume NAME | tenant-remove NAME [--keep-data]
 #
+# Optional S3 service on this server (Versity S3 Gateway, one bucket per tenant):
+#   ./deploy.sh s3 enable | s3 disable [--delete-data] | s3 status
+#   ./deploy.sh s3-tenant-add NAME | s3-tenant-remove NAME     (or tenant-add NAME --s3)
+#
 # Non-interactive installs read VCSP_ADMIN_USER, VCSP_ADMIN_PASSWORD and
 # VCSP_LIB_PASSWORD from the environment; missing passwords are generated
 # and written to /root/vcsp-initial-credentials.txt (mode 0600).
@@ -34,7 +38,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly VCSP_VERSION="2.2.1"
+readonly VCSP_VERSION="2.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VCSP_HOME=/opt/vcsp
@@ -53,6 +57,15 @@ readonly PROXY_KEY_FILE=$VCSP_ETC/proxy.key                # must match PROXY_KE
 readonly NGINX_PROXY_KEY_CONF=/etc/nginx/vcsp-proxy-key.conf
 readonly TENANT_NAME_RE='^[a-z][a-z0-9-]{1,30}[a-z0-9]$'
 readonly RESERVED_TENANTS="lib upload api tenants admin provider default static archive"
+# Optional S3 service: pinned Versity S3 Gateway release (Apache 2.0), verified by SHA-256.
+readonly VGW_VERSION="1.8.0"
+readonly VGW_TARBALL="versitygw_v${VGW_VERSION}_Linux_x86_64.tar.gz"
+readonly VGW_SHA256="2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467"
+readonly VGW_URL="https://github.com/versity/versitygw/releases/download/v${VGW_VERSION}/${VGW_TARBALL}"
+readonly S3_HOME=$VCSP_HOME/s3
+readonly S3_ENV_FILE=$VCSP_ETC/s3-server.env
+readonly S3_STATE_DIR=/var/lib/vcsp-s3
+readonly S3_USER=vcsps3
 
 # Photon OS package names for everything this script and the services run.
 # python3-xml carries xml.etree (OVF parsing); openssl creates certificates and
@@ -117,6 +130,7 @@ load_config() {
   UPLOAD_LISTEN=127.0.0.1; UPLOAD_PORT=8080; UPLOAD_CHUNK_MB=64; INDEX_INTERVAL=5min
   HTTP_REDIRECT=yes; LISTEN_IPV6=no; MANAGE_FIREWALL=yes; TLS_ORG="IT Infrastructure"; TENANT_DEFAULT_QUOTA_GB=0; EMBED_ALLOWED_ORIGINS=""
   S3_ALLOWED_ENDPOINTS=""; S3_DEFAULT_REGION="us-east-1"; S3_ADDRESSING="path"; S3_CA_FILE=""
+  S3_SERVER_ENABLED=no; S3_SERVER_PORT=9000; S3_SERVER_ADMIN_PORT=7070; S3_SERVER_DATA=""
   local src=$CONF_FILE
   [[ -f $src ]] || src=$SCRIPT_DIR/config/vcsp.conf
   [[ -f $src ]] || die "no configuration found ($CONF_FILE or $SCRIPT_DIR/config/vcsp.conf)"
@@ -177,7 +191,9 @@ merge_new_settings() {  # append settings introduced by this release, with the s
 }
 
 s3_status_line() {  # one line describing whether tenants can import from S3
-  if [[ -n ${S3_ALLOWED_ENDPOINTS// /} ]]; then
+  if [[ ${S3_SERVER_ENABLED:-no} == yes ]]; then
+    echo "S3 import: on for ${S3_ALLOWED_ENDPOINTS}; S3 service on this server: $(s3_endpoint)"
+  elif [[ -n ${S3_ALLOWED_ENDPOINTS// /} ]]; then
     echo "S3 import: on for ${S3_ALLOWED_ENDPOINTS}"
   else
     echo "S3 import: off. To enable it, set S3_ALLOWED_ENDPOINTS in $CONF_FILE and run deploy.sh install"
@@ -304,7 +320,9 @@ write_bundle_manifest() {  # write_bundle_manifest DEST RPMS_DOWNLOADED_AT REUSE
     else
       find rpms -type f -print0 | sort -z | xargs -0 sha256sum
     fi
-    find payload BUNDLE.txt -type f -print0 | sort -z | xargs -0 sha256sum
+    extra=()
+    if [[ -d extras ]]; then extra=(extras); fi
+    find payload BUNDLE.txt "${extra[@]}" -type f -print0 | sort -z | xargs -0 sha256sum
   ) > "$dest/SHA256SUMS.tmp"
   mv "$dest/SHA256SUMS.tmp" "$dest/SHA256SUMS"
 }
@@ -353,6 +371,9 @@ download_prerequisites() {  # download_prerequisites DEST [ARCHIVE yes|no] [REFR
   fi
 
   refresh_payload "$dest"
+  if ! (s3_fetch_tarball "$dest/extras"); then
+    warn "could not add the optional S3 service ($VGW_TARBALL) to the bundle; 'deploy.sh s3 enable' will then need internet access"
+  fi
   write_bundle_manifest "$dest" "$created" "$reuse"
   VERIFIED_BUNDLE=$(cd "$dest" && pwd)
   info "Bundle ready: $(sed -n 's/^rpm_count=//p' "$dest/BUNDLE.txt") RPMs, $(du -sh "$dest" | cut -f1)"
@@ -556,6 +577,7 @@ cert_install() {
   chmod 0644 "$TLS_DIR/server.crt"
   if nginx -t -q; then
     systemctl reload nginx
+    if [[ ${S3_SERVER_ENABLED:-no} == yes ]]; then systemctl restart vcsp-s3.service; fi
     info "Certificate installed. SHA-256 fingerprint: $(fingerprint)"
     info "Subscribers that trusted the old certificate must trust the new one (VCD: Trusted Certificates)."
   else
@@ -911,6 +933,11 @@ configure_systemd() {
   systemctl restart vcsp-upload.service
   systemctl restart vcsp-index.timer
   systemctl enable --now logrotate.timer >/dev/null 2>&1 || true
+  if [[ ${S3_SERVER_ENABLED:-no} == yes ]]; then
+    install -m 0644 "$VCSP_HOME/systemd/vcsp-s3.service" /etc/systemd/system/vcsp-s3.service
+    systemctl daemon-reload
+    systemctl restart vcsp-s3.service
+  fi
   info "Services enabled: vcsp-upload.service, vcsp-index.timer (every $INDEX_INTERVAL)"
 }
 
@@ -1142,7 +1169,7 @@ tenant_rollback() {  # EXIT trap during tenant-add: remove whatever a failed onb
 }
 
 tenant_add() {
-  local t=${1:-} display="" quota="" lib_allow="" admin_allow="" admin_pw lib_pw
+  local t=${1:-} display="" quota="" lib_allow="" admin_allow="" admin_pw lib_pw with_s3=no
   shift || true
   while (( $# )); do
     case $1 in
@@ -1152,12 +1179,14 @@ tenant_add() {
       --lib-allow) lib_allow=${2:?--lib-allow needs CIDRs}; shift 2 ;;
       --admin-allow) admin_allow=${2:?--admin-allow needs CIDRs}; shift 2 ;;
       --non-interactive) NON_INTERACTIVE=1; shift ;;
+      --s3) with_s3=yes; shift ;;
       *) die "unknown option $1" ;;
     esac
   done
   require_root
   load_config
   [[ -f $CONF_FILE && -x $VCSP_HOME/bin/vcsp-index ]] || die "install the library first: deploy.sh install"
+  if [[ $with_s3 == yes ]]; then s3_require_running; fi
   validate_tenant_name "$t" new
   display=${display:-$t}
   validate_display "$display"
@@ -1205,6 +1234,7 @@ tenant_add() {
   (( CHECK_FAILS == 0 )) || die "tenant $t did not pass its checks"
   TENANT_CREATING=""
   trap - EXIT
+  if [[ $with_s3 == yes ]]; then s3_tenant_add "$t"; fi
 
   if (( ${#GENERATED[@]} )); then
     local cred="/root/vcsp-tenant-$t-credentials.txt"
@@ -1342,8 +1372,305 @@ tenant_remove() {
     cp -p "$TENANT_CONF_DIR/$t/tenant.conf" "$archive/tenant.conf"
     info "Library of $t archived in $archive"
   fi
+  local s3key s3bucket
+  s3key=$(tenant_get "$t" TENANT_S3_ACCESS_KEY)
+  s3bucket=$(tenant_get "$t" TENANT_S3_BUCKET)
+  if [[ -n $s3key && ${S3_SERVER_ENABLED:-no} == yes ]]; then
+    s3_admin delete-user --access "$s3key" >/dev/null 2>&1 || warn "could not delete S3 account $s3key"
+  fi
+  if [[ -n $s3bucket && -d $(s3_data_dir)/$s3bucket ]]; then
+    if [[ $keep == yes ]]; then
+      archive=${archive:-"$DATA_ROOT_REAL/archive/$t-$(date -u +%Y%m%dT%H%M%SZ)"}
+      install -d -m 0750 -o root -g root "$DATA_ROOT_REAL/archive" "$archive"
+      mv "$(s3_data_dir)/$s3bucket" "$archive/s3-$s3bucket"
+      info "S3 bucket $s3bucket of $t archived in $archive"
+    else
+      rm -rf "$(s3_data_dir)/${s3bucket:?}"
+    fi
+  fi
   rm -rf "${DATA_ROOT_REAL:?}/tenants/$t" "${STATE_DIR_REAL:?}/tenants/$t" "${TENANT_CONF_DIR:?}/$t"
   info "Tenant $t removed; its subscription URL and portal no longer exist"
+}
+
+# ----------------------------------------------------------------- optional S3 service
+# 'deploy.sh s3 enable' runs Versity S3 Gateway (Apache 2.0) on this server with the
+# POSIX backend: buckets are directories and objects are ordinary files under
+# S3_SERVER_DATA. It uses the library's TLS certificate on S3_SERVER_PORT, keeps its
+# admin API on 127.0.0.1 only, and gives each tenant one account that owns one bucket.
+
+s3_data_dir() { if [[ -n ${S3_SERVER_DATA:-} ]]; then realpath -m -- "$S3_SERVER_DATA"; else echo "$DATA_ROOT_REAL/s3"; fi; }
+s3_endpoint() { echo "https://$SERVER_FQDN:${S3_SERVER_PORT:-9000}"; }
+
+s3_fetch_tarball() {  # s3_fetch_tarball DIR: place the pinned, checksum-verified release in DIR
+  local dir=$1 file="$1/$VGW_TARBALL"
+  mkdir -p "$dir"
+  if [[ -f $file ]] && [[ $(sha256sum "$file" | cut -d' ' -f1) == "$VGW_SHA256" ]]; then
+    return 0
+  fi
+  info "Downloading Versity S3 Gateway $VGW_VERSION"
+  curl -fsSL --retry 3 -o "$file.part" "$VGW_URL" || { rm -f "$file.part"; die "cannot download $VGW_URL"; }
+  [[ $(sha256sum "$file.part" | cut -d' ' -f1) == "$VGW_SHA256" ]] \
+    || { rm -f "$file.part"; die "the downloaded $VGW_TARBALL does not match the pinned SHA-256; refusing to use it"; }
+  mv "$file.part" "$file"
+}
+
+s3_find_tarball() {  # prints a verified tarball path: offline bundle first, then the local cache, else download
+  local candidate
+  for candidate in "$SCRIPT_DIR/../extras/$VGW_TARBALL" "$BUNDLE_CACHE/extras/$VGW_TARBALL"; do
+    if [[ -f $candidate ]] && [[ $(sha256sum "$candidate" | cut -d' ' -f1) == "$VGW_SHA256" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  s3_fetch_tarball "$BUNDLE_CACHE/extras" >&2
+  echo "$BUNDLE_CACHE/extras/$VGW_TARBALL"
+}
+
+s3_env() {  # s3_env KEY: value from the service environment file (root only)
+  sed -n "s/^$1=//p" "$S3_ENV_FILE" | tail -n 1
+}
+
+s3_admin() {  # s3_admin ARGS...: versitygw admin over loopback, root credentials from the environment
+  ADMIN_ACCESS_KEY_ID=$(s3_env ROOT_ACCESS_KEY_ID) ADMIN_SECRET_ACCESS_KEY=$(s3_env ROOT_SECRET_ACCESS_KEY) \
+    "$S3_HOME/versitygw" admin --endpoint-url "http://127.0.0.1:${S3_SERVER_ADMIN_PORT:-7070}" "$@"
+}
+
+s3_random() {  # s3_random LENGTH [UPPER]: random alphanumeric string
+  local out=""
+  while (( ${#out} < $1 )); do
+    out+=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9')
+  done
+  out=${out:0:$1}
+  if [[ ${2:-} == upper ]]; then out=${out^^}; fi
+  printf '%s' "$out"
+}
+
+s3_firewall() {  # s3_firewall open|close
+  [[ $MANAGE_FIREWALL == yes ]] && command -v iptables >/dev/null || return 0
+  local port=${S3_SERVER_PORT:-9000}
+  if [[ $1 == open ]]; then
+    iptables -C INPUT -p tcp -m tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -m tcp --dport "$port" -j ACCEPT
+  else
+    while iptables -C INPUT -p tcp -m tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p tcp -m tcp --dport "$port" -j ACCEPT
+    done
+  fi
+  if [[ -d /etc/systemd/scripts ]]; then iptables-save > /etc/systemd/scripts/ip4save; fi
+}
+
+s3_python_trusts() {  # does the portal backend trust the S3 service's certificate?
+  as_user "$VCSP_USER" python3 -c '
+import socket, ssl, sys
+ctx = ssl.create_default_context()
+if sys.argv[3]: ctx.load_verify_locations(cafile=sys.argv[3])
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=10) as s:
+    with ctx.wrap_socket(s, server_hostname=sys.argv[1]): pass' "$SERVER_FQDN" "${S3_SERVER_PORT:-9000}" "${S3_CA_FILE:-}" 2>/dev/null
+}
+
+s3_trust_setup() {  # make the portal trust the library certificate the S3 service presents
+  s3_python_trusts && return 0
+  local trust=$VCSP_ETC/s3-trust.pem tmp
+  tmp=$(mktemp)
+  if [[ -n ${S3_CA_FILE:-} && -r $S3_CA_FILE && $(realpath -- "$S3_CA_FILE") != "$trust" ]]; then
+    cat "$S3_CA_FILE" >> "$tmp"
+  fi
+  cat "$TLS_DIR/server.crt" >> "$tmp"
+  install -m 0644 -o root -g root "$tmp" "$trust"
+  rm -f "$tmp"
+  set_conf_value S3_CA_FILE "$trust"
+  S3_CA_FILE=$trust
+  if s3_python_trusts; then
+    info "The portal now trusts the S3 service certificate (S3_CA_FILE=$trust)"
+  else
+    warn "the portal cannot verify the S3 service certificate; add your CA to $trust (S3_CA_FILE)"
+  fi
+}
+
+s3_allow_endpoint() {  # s3_allow_endpoint add|remove: keep S3_ALLOWED_ENDPOINTS in step with the service
+  local ep list=() e
+  ep=$(s3_endpoint)
+  for e in ${S3_ALLOWED_ENDPOINTS//,/ }; do
+    [[ ${e%/} == "$ep" ]] || list+=("${e%/}")
+  done
+  [[ $1 == add ]] && list+=("$ep")
+  S3_ALLOWED_ENDPOINTS="${list[*]}"
+  set_conf_value S3_ALLOWED_ENDPOINTS "$S3_ALLOWED_ENDPOINTS"
+}
+
+s3_wait_healthy() {
+  local _
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null --max-time 3 ${S3_CA_FILE:+--cacert "$S3_CA_FILE"} "$(s3_endpoint)/health" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+s3_enable() {
+  require_root
+  load_config
+  [[ -f $CONF_FILE && -s $TLS_DIR/server.crt && -x $VCSP_HOME/bin/vcsp-index ]] || die "install the library first: deploy.sh install"
+  [[ ${S3_SERVER_PORT:-9000} =~ ^[0-9]+$ && ${S3_SERVER_ADMIN_PORT:-7070} =~ ^[0-9]+$ ]] || die "S3_SERVER_PORT and S3_SERVER_ADMIN_PORT must be numbers"
+  local data tarball
+  data=$(s3_data_dir)
+  info "Enabling the S3 service on $(s3_endpoint) (buckets in $data)"
+
+  getent group "$S3_USER" >/dev/null || groupadd -r "$S3_USER"
+  id "$S3_USER" >/dev/null 2>&1 || useradd -r -g "$S3_USER" -d "$S3_STATE_DIR" -s "$(command -v nologin || echo /bin/false)" \
+    -c "VCSP content library S3 service" "$S3_USER"
+  install -d -m 0750 -o "$S3_USER" -g "$S3_USER" "$data"
+  install -d -m 0700 -o "$S3_USER" -g "$S3_USER" "$S3_STATE_DIR" "$S3_STATE_DIR/iam"
+  as_user "$S3_USER" python3 -c 'import os, sys; os.setxattr(sys.argv[1], "user.vcsp-probe", b"1"); os.removexattr(sys.argv[1], "user.vcsp-probe")' "$data" \
+    || die "$data does not support extended attributes, which the S3 service stores object metadata in (use ext4 or xfs)"
+
+  tarball=$(s3_find_tarball)
+  install -d -m 0755 "$S3_HOME"
+  tar -xzOf "$tarball" "versitygw_v${VGW_VERSION}_Linux_x86_64/versitygw" > "$S3_HOME/versitygw.new"
+  chmod 0755 "$S3_HOME/versitygw.new"
+  mv "$S3_HOME/versitygw.new" "$S3_HOME/versitygw"
+  cat > "$S3_HOME/run-s3-server" <<'EOF'
+#!/bin/sh
+# Starts Versity S3 Gateway for the VCSP content library. systemd supplies the library's
+# TLS certificate and key through LoadCredential and the settings through EnvironmentFile.
+set -eu
+exec /opt/vcsp/s3/versitygw \
+  --port ":${VCSP_S3_PORT}" \
+  --cert "${CREDENTIALS_DIRECTORY}/tls.crt" --key "${CREDENTIALS_DIRECTORY}/tls.key" \
+  --admin-port "127.0.0.1:${VCSP_S3_ADMIN_PORT}" \
+  --iam-dir "${VCSP_S3_IAM_DIR}" \
+  --health /health \
+  posix "${VCSP_S3_DATA}"
+EOF
+  chmod 0755 "$S3_HOME/run-s3-server"
+
+  local root_key root_secret tmp
+  if [[ -s $S3_ENV_FILE ]]; then
+    root_key=$(s3_env ROOT_ACCESS_KEY_ID)
+    root_secret=$(s3_env ROOT_SECRET_ACCESS_KEY)
+  fi
+  root_key=${root_key:-VCSPROOT$(s3_random 12 upper)}
+  root_secret=${root_secret:-$(s3_random 40)}
+  tmp=$(mktemp)
+  printf '# Generated by deploy.sh - S3 service settings and root credentials (never share these).\n' > "$tmp"
+  printf 'ROOT_ACCESS_KEY_ID=%s\nROOT_SECRET_ACCESS_KEY=%s\nVCSP_S3_PORT=%s\nVCSP_S3_ADMIN_PORT=%s\nVCSP_S3_IAM_DIR=%s\nVCSP_S3_DATA=%s\n' \
+    "$root_key" "$root_secret" "${S3_SERVER_PORT:-9000}" "${S3_SERVER_ADMIN_PORT:-7070}" "$S3_STATE_DIR/iam" "$data" >> "$tmp"
+  install -m 0600 -o root -g root "$tmp" "$S3_ENV_FILE"
+  rm -f "$tmp"
+
+  install -m 0644 "$VCSP_HOME/systemd/vcsp-s3.service" /etc/systemd/system/vcsp-s3.service
+  install -d -m 0755 /etc/systemd/system/vcsp-s3.service.d
+  printf '[Service]\nReadWritePaths=%s %s\n' "$data" "$S3_STATE_DIR" > /etc/systemd/system/vcsp-s3.service.d/10-paths.conf
+  set_conf_value S3_SERVER_ENABLED yes
+  S3_SERVER_ENABLED=yes
+  s3_firewall open
+  systemctl daemon-reload
+  systemctl enable vcsp-s3.service >/dev/null 2>&1
+  systemctl restart vcsp-s3.service
+  s3_wait_healthy || warn "the S3 service did not answer yet; see journalctl -u vcsp-s3"
+  s3_trust_setup
+  s3_allow_endpoint add
+  systemctl restart vcsp-upload.service
+  info "S3 service enabled: $(s3_endpoint)  (create tenant accounts with: deploy.sh s3-tenant-add NAME)"
+}
+
+s3_disable() {
+  local purge=${1:-no} data answer
+  require_root
+  load_config
+  data=$(s3_data_dir)
+  systemctl disable --now vcsp-s3.service >/dev/null 2>&1 || true
+  s3_firewall close
+  s3_allow_endpoint remove
+  set_conf_value S3_SERVER_ENABLED no
+  systemctl restart vcsp-upload.service
+  info "S3 service disabled; tenants can no longer import from $(s3_endpoint)"
+  if [[ $purge == yes ]]; then
+    if [[ ${VCSP_CONFIRM_PURGE:-} != yes ]]; then
+      read -rp "Type 'delete' to delete every bucket in $data and the S3 accounts permanently: " answer
+      [[ $answer == delete ]] || die "purge cancelled; bucket data kept"
+    fi
+    rm -rf "${data:?}" "${S3_STATE_DIR:?}" "$S3_ENV_FILE" /etc/systemd/system/vcsp-s3.service /etc/systemd/system/vcsp-s3.service.d
+    systemctl daemon-reload
+    local t
+    while read -r t; do
+      [[ -n $t ]] && tenant_set "$t" TENANT_S3_BUCKET "" && tenant_set "$t" TENANT_S3_ACCESS_KEY ""
+    done < <(tenant_names all)
+    info "Bucket data, S3 accounts and the service definition deleted"
+  else
+    info "Bucket data kept in $data; 'deploy.sh s3 enable' brings the service back with the same accounts"
+  fi
+}
+
+s3_require_running() {
+  [[ ${S3_SERVER_ENABLED:-no} == yes ]] || die "the S3 service is not enabled (deploy.sh s3 enable)"
+  s3_admin list-users >/dev/null 2>&1 || die "the S3 service does not answer on its admin port; see journalctl -u vcsp-s3"
+}
+
+s3_tenant_add() {  # s3_tenant_add NAME: an S3 account for the tenant that owns bucket <name>-images
+  local t=${1:-} bucket key secret cred
+  validate_tenant_name "$t"
+  s3_require_running
+  [[ -z $(tenant_get "$t" TENANT_S3_ACCESS_KEY) ]] || die "tenant $t already has an S3 account; remove it first with deploy.sh s3-tenant-remove $t"
+  bucket="$t-images"
+  key="VCSP$(s3_random 16 upper)"
+  secret=$(s3_random 40)
+  s3_admin create-user --access "$key" --secret "$secret" --role user >/dev/null || die "creating the S3 account failed"
+  if s3_admin list-buckets 2>/dev/null | awk '{print $1}' | grep -qx "$bucket"; then
+    s3_admin change-bucket-owner --bucket "$bucket" --owner "$key" >/dev/null || die "handing bucket $bucket to the new account failed"
+  else
+    s3_admin create-bucket --bucket "$bucket" --owner "$key" >/dev/null || die "creating bucket $bucket failed"
+  fi
+  tenant_set "$t" TENANT_S3_ACCESS_KEY "$key"
+  tenant_set "$t" TENANT_S3_BUCKET "$bucket"
+  tenant_set "$t" TENANT_S3_ENDPOINT "$(s3_endpoint)"
+  cred="/root/vcsp-s3-$t-credentials.txt"
+  {
+    echo "# VCSP S3 account for tenant $t ($(date -u +%Y-%m-%dT%H:%MZ)). Hand to the tenant, then delete this file."
+    echo "Endpoint:          $(s3_endpoint)"
+    echo "Region:            us-east-1 (path-style addressing)"
+    echo "Bucket:            $bucket"
+    echo "Access key ID:     $key"
+    echo "Secret access key: $secret"
+    echo
+    echo "# Example with the AWS CLI:"
+    echo "#   aws configure set aws_access_key_id $key && aws configure set aws_secret_access_key <secret>"
+    echo "#   aws --endpoint-url $(s3_endpoint) s3 cp ubuntu-22.04.ova s3://$bucket/"
+  } > "$cred"
+  chmod 0600 "$cred"
+  info "Tenant $t: S3 account $key owns bucket $bucket; credentials in $cred (mode 0600)"
+}
+
+s3_tenant_remove() {  # s3_tenant_remove NAME: delete the account; the bucket and its data stay
+  local t=${1:-} key
+  validate_tenant_name "$t"
+  key=$(tenant_get "$t" TENANT_S3_ACCESS_KEY)
+  [[ -n $key ]] || die "tenant $t has no S3 account"
+  s3_require_running
+  s3_admin delete-user --access "$key" >/dev/null || die "deleting S3 account $key failed"
+  tenant_set "$t" TENANT_S3_ACCESS_KEY ""
+  info "Tenant $t: S3 account $key deleted; bucket $(tenant_get "$t" TENANT_S3_BUCKET) and its data are kept (s3-tenant-add $t hands it to a new account)"
+}
+
+s3_status() {
+  require_root
+  load_config
+  if [[ ${S3_SERVER_ENABLED:-no} != yes ]]; then
+    echo "S3 service: not enabled (deploy.sh s3 enable)"
+    return 0
+  fi
+  echo "S3 service: $(systemctl is-active vcsp-s3.service 2>/dev/null || echo unknown) on $(s3_endpoint), Versity S3 Gateway $VGW_VERSION"
+  echo "Bucket storage: $(s3_data_dir) ($(du -sh "$(s3_data_dir)" 2>/dev/null | cut -f1) used, $(df -h --output=avail "$(s3_data_dir)" | tail -1 | tr -d ' ') free)"
+  echo
+  s3_admin list-buckets 2>/dev/null || echo "(admin API not reachable)"
+}
+
+s3_command() {  # deploy.sh s3 enable|disable [--delete-data]|status
+  case ${1:-status} in
+    enable) s3_enable ;;
+    disable) if [[ ${2:-} == --delete-data ]]; then s3_disable yes; else s3_disable no; fi ;;
+    status) s3_status ;;
+    *) die "usage: deploy.sh s3 enable | disable [--delete-data] | status" ;;
+  esac
 }
 
 # ----------------------------------------------------------------- verification
@@ -1395,6 +1722,12 @@ s3_endpoint_ok() {  # TLS handshake succeeds and the endpoint answers HTTP (any 
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 ${S3_CA_FILE:+--cacert "$S3_CA_FILE"} "$1/" || true)
   [[ $code =~ ^[1-5][0-9][0-9]$ ]]
+}
+
+s3_admin_loopback_only() {  # every listener on the admin port is bound to 127.0.0.1
+  local addrs
+  addrs=$(ss -Htln "sport = :${S3_SERVER_ADMIN_PORT:-7070}" 2>/dev/null | awk '{print $4}')
+  [[ -n $addrs ]] && ! grep -qv '^127\.0\.0\.1:' <<< "$addrs"
 }
 
 json_401() {  # a failed API sign-in answers 401 with a JSON body the portal can display
@@ -1458,6 +1791,12 @@ verify() {
   for ep in ${S3_ALLOWED_ENDPOINTS//,/ }; do
     check "S3 endpoint ${ep%/} is reachable with a trusted certificate" s3_endpoint_ok "${ep%/}"
   done
+  if [[ ${S3_SERVER_ENABLED:-no} == yes ]]; then
+    check "S3 service is running" systemctl is-active --quiet vcsp-s3
+    check "S3 service answers its health check" curl -s -o /dev/null --max-time 5 ${S3_CA_FILE:+--cacert "$S3_CA_FILE"} "$(s3_endpoint)/health"
+    check "S3 admin API answers on 127.0.0.1:${S3_SERVER_ADMIN_PORT}" s3_admin list-users
+    check "S3 admin API is not reachable from the network" s3_admin_loopback_only
+  fi
   info "$(s3_status_line)"
   check "backend refuses requests that bypass nginx" \
     test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-VCSP-Tenant: _provider' "http://$UPLOAD_LISTEN:$UPLOAD_PORT/api/config" || true)" = 403
@@ -1557,8 +1896,9 @@ uninstall() {
   local purge=${1:-no} answer
   require_root
   load_config
-  systemctl disable --now vcsp-upload.service vcsp-index.timer >/dev/null 2>&1 || true
-  rm -rf /etc/systemd/system/vcsp-upload.service* /etc/systemd/system/vcsp-index.service* /etc/systemd/system/vcsp-index.timer*
+  systemctl disable --now vcsp-upload.service vcsp-index.timer vcsp-s3.service >/dev/null 2>&1 || true
+  rm -rf /etc/systemd/system/vcsp-upload.service* /etc/systemd/system/vcsp-index.service* /etc/systemd/system/vcsp-index.timer* \
+    /etc/systemd/system/vcsp-s3.service*
   systemctl daemon-reload
   if [[ -f $NGINX_CONF.photon-default ]]; then
     cp -p "$NGINX_CONF.photon-default" "$NGINX_CONF"
@@ -1574,7 +1914,7 @@ uninstall() {
       read -rp "Type 'purge' to delete $DATA_ROOT, $STATE_DIR and $VCSP_ETC permanently: " answer
       [[ $answer == purge ]] || die "purge cancelled; data kept"
     fi
-    rm -rf "$DATA_ROOT_REAL" "$STATE_DIR_REAL" "$VCSP_ETC"
+    rm -rf "$DATA_ROOT_REAL" "$STATE_DIR_REAL" "$VCSP_ETC" "$S3_STATE_DIR" "$(s3_data_dir)"
     info "Library data, index state and configuration deleted"
   else
     info "Kept: library $DATA_ROOT, index state $STATE_DIR, configuration $VCSP_ETC"
@@ -1626,6 +1966,9 @@ main() {
       if [[ ${1:-} == --purge ]]; then uninstall yes; else uninstall no; fi
       ;;
     tenant-add) tenant_add "$@" ;;
+    s3) s3_command "$@" ;;
+    s3-tenant-add) require_root; load_config; s3_tenant_add "${1:-}" ;;
+    s3-tenant-remove) require_root; load_config; s3_tenant_remove "${1:-}" ;;
     tenant-list) require_root; load_config; tenant_list ;;
     tenant-show) require_root; load_config; tenant_show "${1:-}" ;;
     tenant-update) require_root; load_config; tenant_update "$@" ;;

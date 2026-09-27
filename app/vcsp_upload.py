@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vcsp_validate as V  # noqa: E402
 import vcsp_s3 as S3  # noqa: E402
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 META_FILE = ".vcsp-meta.json"
 COPY_BUF = 1 << 20
 PROVIDER = "_provider"
@@ -151,6 +151,7 @@ class Scope:
             self.url_path = "/lib/lib.json"
             self.quota = 0
             self.state = "active"
+            self.s3_endpoint = self.s3_bucket = ""
         else:
             base = os.path.join(settings.data_root, "tenants", tenant)
             self.lib_root = os.path.join(base, "lib")
@@ -160,6 +161,8 @@ class Scope:
             self.url_path = "/tenants/%s/lib/lib.json" % tenant
             self.quota = int(float(tconf.get("TENANT_QUOTA_GB", "0") or 0) * (1 << 30))
             self.state = tconf.get("TENANT_STATE", "active")
+            self.s3_endpoint = tconf.get("TENANT_S3_ENDPOINT", "").rstrip("/")
+            self.s3_bucket = tconf.get("TENANT_S3_BUCKET", "")
         self.staging = staging
         self.uploads = os.path.join(staging, "uploads")
         self.ready = os.path.join(staging, "ready")
@@ -387,7 +390,9 @@ class Portal:
             "allow_delete": self.s.allow_delete,
             "name_pattern": V.NAME_RE.pattern,
             "s3": {"enabled": bool(self.s3_import_allowed()), "endpoints": self.s.s3_endpoints,
-                   "region": self.s.s3_region, "addressing": self.s.s3_addressing},
+                   "region": self.s.s3_region, "addressing": self.s.s3_addressing,
+                   "suggested": ({"endpoint": sc.s3_endpoint, "bucket": sc.s3_bucket}
+                                 if sc.s3_bucket and sc.s3_endpoint in self.s.s3_endpoints else None)},
             "user": user,
             "version": __version__,
         }

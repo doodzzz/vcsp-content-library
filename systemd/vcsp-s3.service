@@ -1,0 +1,41 @@
+[Unit]
+Description=VCSP content library S3 service (Versity S3 Gateway, POSIX backend)
+Documentation=file:///opt/vcsp/README.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vcsps3
+Group=vcsps3
+UMask=0027
+EnvironmentFile=/etc/vcsp/s3-server.env
+# The library's certificate and key, handed to the service without widening file permissions
+LoadCredential=tls.crt:/etc/vcsp/tls/server.crt
+LoadCredential=tls.key:/etc/vcsp/tls/server.key
+ExecStart=/opt/vcsp/s3/run-s3-server
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+# Writable paths (bucket storage, IAM directory) come from vcsp-s3.service.d/10-paths.conf
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

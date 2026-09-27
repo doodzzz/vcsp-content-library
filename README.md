@@ -34,6 +34,7 @@ Everything runs on the Python 3 standard library and the Photon OS base reposito
 | `app/vcsp_s3.py` | S3 client for imports: AWS Signature V4, bucket listing, resumable verified downloads (standard library only). |
 | `app/static/` | Portal web interface (HTML, CSS, JavaScript; no external assets). |
 | `systemd/` | Hardened units for the backend and the indexer timer. |
+| `systemd/vcsp-s3.service` | Optional S3 service unit, installed by `deploy.sh s3 enable`. |
 | `tests/test_vcsp.py` | End-to-end tests (`python3 tests/test_vcsp.py -v`, no root needed). |
 | `vcd-plugin/` | Cloud Director 10.6 UI plug-in that opens the portal inside Cloud Director (see its README). |
 | `docs/portal.png` | Screenshot of the upload portal. |
@@ -102,7 +103,7 @@ VCSP_ADMIN_USER=libadmin VCSP_ADMIN_PASSWORD='...' VCSP_LIB_PASSWORD='...' \
   ./deploy.sh install --non-interactive
 ```
 
-Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (sixteen checks covering TLS, authentication, the backend and the index, one more when embedding is enabled, one per allowed S3 endpoint, plus five per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
+Any password not supplied is generated and written once to `/root/vcsp-initial-credentials.txt` (mode 0600); move it to your vault and delete the file. The install finishes by running `deploy.sh verify` (sixteen checks covering TLS, authentication, the backend and the index, one more when embedding is enabled, one per allowed S3 endpoint, four more when the S3 service runs on the server, plus five per tenant, including a signed-in download of `lib.json` through nginx with a temporary account that is removed afterwards) and prints the subscription URL and the certificate's SHA-256 fingerprint.
 
 Photon OS ships `/srv` as a symbolic link to `/var/srv`, so with the default `DATA_ROOT=/srv/vcsp` the library physically lives in `/var/srv/vcsp/lib`. The installer resolves links in `DATA_ROOT` and `STATE_DIR` and gives nginx and systemd the real paths; links above the library are fine, but `lib/` and `staging/` themselves must be real folders or bind mounts.
 
@@ -211,6 +212,27 @@ How it stays safe: tenants choose from the provider's endpoint list and cannot t
 
 `tests/test_vcsp.py` includes a live test you can point at your own object storage: set `VCSP_TEST_S3_ENDPOINT`, `VCSP_TEST_S3_BUCKET`, `VCSP_TEST_S3_ACCESS_KEY`, `VCSP_TEST_S3_SECRET_KEY`, `VCSP_TEST_S3_KEY` (and optionally `VCSP_TEST_S3_CA_FILE`) and run `python3 tests/test_vcsp.py S3LiveTests -v`.
 
+## Running S3 on the library server (optional)
+
+If tenants have no object storage of their own, the library server can provide it. `deploy.sh s3 enable` runs [Versity S3 Gateway](https://github.com/versity/versitygw) (Apache 2.0) with its POSIX backend: every bucket is a folder and every object an ordinary file under `S3_SERVER_DATA` (default `DATA_ROOT/s3`), so normal backup tools work. Each tenant gets one S3 account that owns one bucket, `<tenant>-images`; tenants upload OVAs and ISOs with any S3 tool (the AWS CLI, s3cmd, rclone) and import them in the portal, which pre-fills their endpoint and bucket so they only enter their keys.
+
+```bash
+/opt/vcsp/deploy.sh s3 enable                 # install, start, open the port, add to S3_ALLOWED_ENDPOINTS
+/opt/vcsp/deploy.sh s3-tenant-add acme        # account + bucket acme-images; keys in /root/vcsp-s3-acme-credentials.txt
+/opt/vcsp/deploy.sh tenant-add globex --s3    # or onboard a tenant with its S3 account in one step
+/opt/vcsp/deploy.sh s3 status                 # service, storage, buckets and owners
+/opt/vcsp/deploy.sh s3-tenant-remove acme     # delete the account; the bucket and its data stay
+/opt/vcsp/deploy.sh s3 disable [--delete-data]
+```
+
+The service listens on `https://<SERVER_FQDN>:9000` (`S3_SERVER_PORT`) with the library's own certificate, which systemd hands to it with `LoadCredential`, so the private key never gets wider permissions. Its admin API, used by `deploy.sh` to manage accounts, listens on `127.0.0.1:7070` only, and `verify` checks that it cannot be reached from the network. The service runs as its own unprivileged `vcsps3` user under the same systemd sandbox as the other services, with the root credentials in `/etc/vcsp/s3-server.env` (mode 0600). `s3 enable` also makes the portal trust the certificate: when the library certificate is self-signed or from a private CA, it builds `/etc/vcsp/s3-trust.pem` and points `S3_CA_FILE` at it.
+
+Isolation between tenants was tested with the AWS SDK: a tenant account can list, upload to and read only its own bucket, sees only that bucket, cannot create further buckets and cannot touch another tenant's objects; anonymous requests are refused. Removing a tenant with `tenant-remove` deletes its S3 account and bucket (or archives the bucket with `--keep-data`); `s3-tenant-remove` followed by `s3-tenant-add` rotates a tenant's keys and hands the existing bucket to the new account.
+
+The release is pinned (Versity S3 Gateway 1.8.0) and verified by SHA-256; `download-prereqs` puts it in the offline bundle, so `s3 enable` works on air-gapped hosts. To move to a newer release, change `VGW_VERSION` and `VGW_SHA256` at the top of `deploy.sh`, then run `deploy.sh s3 enable` again.
+
+Plan for three things. It is a single node without replication, so durability is that of the underlying datastore and your backups. An image imported from a bucket exists twice, in the bucket and in the library, so size the disk accordingly or give `S3_SERVER_DATA` its own volume. The data folder must support extended attributes (ext4 and xfs do), the library server must resolve its own `SERVER_FQDN`, and tenants' workstations need TCP 9000 to the server.
+
 ## Inside Cloud Director (UI plug-in)
 
 `vcd-plugin/` holds a small Cloud Director 10.6 UI plug-in, **Library Upload**, that shows the upload portal inside the Cloud Director tenant portal (under **More**), so tenant administrators stay in their Cloud Director session. It opens `https://<SERVER_FQDN>/tenants/<organization name in lowercase>/upload/` for tenants and the provider portal for System users; the portal still asks for the tenant's local portal credentials in its own sign-in form.
@@ -263,6 +285,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 | Uploads | Server-side extension allow-list, strict file and item name patterns, magic-byte checks on the first chunk, size limits, free-space reserve, OVA extraction that refuses traversal, links and devices, OVF completeness and manifest digest verification before anything reaches the library. |
 | Tenants | Separate password files, nginx locations, library, staging, index state and quota per tenant; nginx stamps the tenant on every API call and the backend accepts only requests carrying nginx's secret key; one tenant's jobs and uploads are invisible to others. |
 | S3 import | Endpoints only from the provider's allow-list (no tenant-supplied addresses), validated bucket names, no redirects, verified TLS; tenant keys used per request and never stored or logged; quota checked before download; downloaded content goes through the same validation as uploads. |
+| S3 service | Apache 2.0 gateway as its own unprivileged user in a systemd sandbox; TLS key delivered via `LoadCredential`; admin API on loopback only (verified); one account per tenant that owns one bucket and cannot create others; pinned release verified by SHA-256. |
 | Processes | Backend and indexer run as the unprivileged `vcsp` user under systemd sandboxing (`ProtectSystem=strict`, empty capability set, `NoNewPrivileges`, write access limited to `DATA_ROOT` and `STATE_DIR`; the indexer also has no network). The backend listens on loopback only and refuses to run as root. |
 | Supply chain | Standard library only; offline bundle integrity by SHA-256 and RPM signature verification. Hash functions are called with `usedforsecurity=False`, so manifest checks keep working when OpenSSL runs in FIPS mode. |
 
@@ -276,6 +299,7 @@ Useful indexer options: `--status` (list items and states from the state file), 
 /opt/vcsp/deploy.sh add-admin alice            # add or reset a provider portal user
 /opt/vcsp/deploy.sh tenant-add acme            # onboard a tenant (see Multi-tenancy)
 /opt/vcsp/deploy.sh tenant-list                # tenants, sizes and quotas
+/opt/vcsp/deploy.sh s3 status                  # optional S3 service: buckets and owners
 /opt/vcsp/deploy.sh remove-admin alice
 /opt/vcsp/deploy.sh set-library-password       # then update each subscriber's password
 /opt/vcsp/deploy.sh cert-csr                   # /etc/vcsp/tls/server.csr for your CA
@@ -304,6 +328,10 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 | `S3_DEFAULT_REGION` | us-east-1 | Region pre-filled in the portal. |
 | `S3_ADDRESSING` | path | Default addressing style: `path` or `virtual`. |
 | `S3_CA_FILE` | empty | PEM bundle of a private CA that signs the S3 endpoints' certificates. |
+| `S3_SERVER_ENABLED` | no | Managed by `deploy.sh s3 enable` / `s3 disable`. |
+| `S3_SERVER_PORT` | 9000 | HTTPS port of the S3 service on this server. |
+| `S3_SERVER_ADMIN_PORT` | 7070 | Admin API port, bound to 127.0.0.1. |
+| `S3_SERVER_DATA` | empty | Bucket storage; empty means `DATA_ROOT/s3`. |
 | `LIB_ALLOW_CIDRS` / `ADMIN_ALLOW_CIDRS` | empty | Space-separated addresses or CIDRs allowed to reach `/lib/` or the portal. |
 | `ALLOWED_EXTENSIONS` | ovf vmdk mf cert nvram iso ova | Upload allow-list. |
 | `UPLOAD_CHUNK_MB` | 64 | Size of each resumable upload request (1-512). |
@@ -342,6 +370,10 @@ For backup, protect `DATA_ROOT` (the provider library in `lib/` and tenant libra
 **`runuser: command not found` (deploy.sh 2.0.0 and earlier).** Photon OS builds util-linux without PAM, so it has no `runuser`. From 2.0.1 the script drops privileges with Python instead; copy the new `deploy.sh` and re-run `deploy.sh install` (it is idempotent). A `tenant-add` that failed on this error was rolled back, so simply run it again.
 
 **The portal shows no Import from S3 option.** S3 import is off: `deploy.sh status` says so and names the setting. Set `S3_ALLOWED_ENDPOINTS` in `/etc/vcsp/vcsp.conf`, run `deploy.sh install`, then sign in to the portal again (the option only appears after sign-in).
+
+**`s3 enable` stops with "does not support extended attributes".** The S3 service keeps object metadata in extended attributes; put `S3_SERVER_DATA` on ext4 or xfs.
+
+**Tenants cannot reach the S3 service from their workstations.** Open TCP `S3_SERVER_PORT` (9000) in the network firewalls between them and the server; `s3 enable` already opened it on the server itself.
 
 **An S3 listing fails.** The portal shows the reason in plain words. "Not trusted" means the endpoint's CA is missing from `S3_CA_FILE`; "Cannot resolve" or "Cannot connect" means DNS or a firewall between the library server and the endpoint; "served from another region" means the region or addressing style needs changing; a key or signature message means the tenant's credentials are wrong.
 

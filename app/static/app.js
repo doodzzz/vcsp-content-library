@@ -145,6 +145,10 @@
     select.replaceChildren(...s3.endpoints.map((e) => el("option", { value: e, text: e })));
     if (s3.endpoints.includes(current)) select.value = current;
     if (!$("#s3-region").value) $("#s3-region").value = s3.region || "us-east-1";
+    if (s3.suggested) {                       // the tenant's own bucket on this server's S3 service
+      select.value = s3.suggested.endpoint;
+      if (!$("#s3-bucket").value) $("#s3-bucket").value = s3.suggested.bucket;
+    }
     if (!document.querySelector('input[name="s3-addressing"]:checked')) {
       const radio = document.querySelector(`input[name="s3-addressing"][value="${s3.addressing === "virtual" ? "virtual" : "path"}"]`);
       if (radio) radio.checked = true;
